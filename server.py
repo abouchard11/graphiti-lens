@@ -609,6 +609,39 @@ def api_health(g: Graph, q) -> dict:
         "RETURN g AS group, last, episodes ORDER BY last ASC LIMIT 40"
     )
 
+    # --- operability probes (added 2026-08-29) ------------------------------
+    # These answer "is the memory system still actually working", which the
+    # graph-shape checks above cannot see. Two have a remediation path and are
+    # self-healing in the real sense; the third is a detector only, and says so.
+    recent7 = g.one(
+        "MATCH (e:Episodic) WHERE ($group IS NULL OR e.group_id = $group) "
+        "AND e.created_at >= datetime() - duration({days: 7}) RETURN count(e) AS c", p
+    ).get("c", 0) or 0
+    emb_n = g.one(
+        "MATCH (n:Entity) WHERE ($group IS NULL OR n.group_id = $group) "
+        "RETURN count(n) AS total, "
+        "sum(CASE WHEN n.name_embedding IS NULL THEN 1 ELSE 0 END) AS missing", p
+    )
+    emb_e = g.one(
+        "MATCH ()-[r:RELATES_TO]->() WHERE ($group IS NULL OR r.group_id = $group) "
+        "RETURN count(r) AS total, "
+        "sum(CASE WHEN r.fact_embedding IS NULL THEN 1 ELSE 0 END) AS missing", p
+    )
+    emb_total = (emb_n.get("total", 0) or 0) + (emb_e.get("total", 0) or 0)
+    emb_missing = (emb_n.get("missing", 0) or 0) + (emb_e.get("missing", 0) or 0)
+    # Filesystem, not Neo4j. The MCP server spools an episode before ingesting and
+    # clears it only on a confirmed write, so anything left behind is a replayable
+    # loss. Only meaningful when Lens runs on the MCP server's host, which it does.
+    spool_dir = Path(
+        os.environ.get("GRAPHITI_SPOOL_DIR", Path.home() / ".local" / "state" / "graphiti-spool")
+    )
+    try:
+        spooled = len(list(spool_dir.glob("*.json"))) if spool_dir.is_dir() else 0
+    except OSError:
+        spooled = 0
+    expected7 = (sum((r["c"] or 0) for r in daily) / 60.0) * 7 if daily else 0.0
+    ingest_ratio = 100.0 if expected7 <= 0 else min(100.0, round(recent7 / expected7 * 100, 1))
+
     et, ep_t = edges.get("total", 0) or 0, episodes.get("total", 0) or 0
     en_t = ents.get("total", 0) or 0
     tagged = (episodes.get("observed", 0) or 0) + (episodes.get("derived", 0) or 0)
@@ -653,6 +686,26 @@ def api_health(g: Graph, q) -> dict:
          "good": 99, "warn": 95,
          "detail": f"{dupes.get('redundant', 0)} redundant across {dupes.get('clusters', 0)} name clusters"},
     ]
+    checks += [
+        # SELF-HEALING: a non-empty spool is a recoverable loss with a known fix.
+        {"id": "spool_drained", "label": "Episode write-ahead spool drained",
+         "value": 100.0 if spooled == 0 else 0.0, "unit": "%", "good": 100, "warn": 100,
+         "detail": "spool empty" if spooled == 0 else
+                   f"{spooled} unreplayed episode(s) in {spool_dir} - "
+                   f"recover with mcp_server/scripts/replay_spool.py"},
+        # SELF-HEALING: a missing embedding is invisible to semantic search; re-embed.
+        {"id": "embedding_coverage", "label": "Entities and facts carrying an embedding",
+         "value": pct(emb_total - emb_missing, emb_total), "unit": "%", "good": 100, "warn": 99,
+         "detail": f"{emb_missing:,} of {emb_total:,} carry no embedding and cannot be "
+                   f"reached by semantic search"},
+        # DETECTOR ONLY - no automatic remediation, because writing to memory is a
+        # behaviour, not a service. On 2026-08-28 this graph took 1 episode against a
+        # ~18/day baseline and nothing surfaced it: the sparkline carries no threshold.
+        {"id": "ingest_live", "label": "Last 7 days' ingest vs the 60-day rate",
+         "value": ingest_ratio, "unit": "%", "good": 50, "warn": 25,
+         "detail": f"{recent7} episodes in 7 days against an expected ~{expected7:.0f}"},
+    ]
+
     for c in checks:
         c["status"] = "good" if c["value"] >= c["good"] else ("warning" if c["value"] >= c["warn"] else "critical")
 
@@ -686,6 +739,13 @@ def api_health(g: Graph, q) -> dict:
             "entities_without_summary": ents.get("no_summary", 0),
             "duplicate_clusters": dupes.get("clusters", 0),
             "redundant_entities": dupes.get("redundant", 0),
+        },
+        "operability": {
+            "spooled_episodes": spooled,
+            "spool_dir": str(spool_dir),
+            "missing_embeddings": emb_missing,
+            "episodes_last_7d": recent7,
+            "expected_7d": round(expected7, 1),
         },
         "checks": checks,
         "duplicates": [{k: jsonable(v) for k, v in r.items()} for r in dupe_rows],
