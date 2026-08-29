@@ -1,0 +1,897 @@
+#!/usr/bin/env python3
+"""
+Graphiti Lens - a read-only local explorer for a Graphiti temporal knowledge graph
+stored in Neo4j.
+
+Design notes:
+  * Loopback-only bind + per-run bearer token. Credentials never reach the browser.
+  * EVERY query runs inside an explicit Neo4j READ transaction, so the server
+    rejects writes even if a query slips past the lexical guard.
+  * All first-party endpoints use bound parameters. The only place raw Cypher is
+    accepted is /api/cypher, which is guarded twice (lexical denylist + read txn).
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import secrets
+import sys
+import threading
+import webbrowser
+from datetime import datetime, timezone
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from urllib.parse import urlparse, parse_qs
+
+try:
+    from neo4j import GraphDatabase
+    from neo4j.exceptions import Neo4jError
+except ImportError:  # pragma: no cover
+    sys.exit(
+        "neo4j driver not found.\n"
+        "Run via ./run.sh, or: uv run --with 'neo4j>=5,<6' python3 server.py"
+    )
+
+HERE = Path(__file__).resolve().parent
+STATIC = HERE / "static"
+
+# Where to look for Neo4j credentials if the environment does not supply them.
+ENV_CANDIDATES = [
+    HERE / ".env",
+    Path.home() / "dev" / "graphiti" / "mcp_server" / ".env",
+]
+
+MAX_ROWS = 5000
+DEFAULT_NODE_BUDGET = 1200
+QUERY_TIMEOUT_S = 30
+
+# Lexical guard for the Cypher console. The read transaction is the real
+# enforcement; this exists to fail fast with a clear message.
+WRITE_TOKENS = re.compile(
+    r"\b(CREATE|MERGE|DELETE|DETACH|SET|REMOVE|DROP|FOREACH|LOAD\s+CSV|"
+    r"CALL\s*\{[^}]*\b(CREATE|MERGE|DELETE|SET)\b)\b",
+    re.IGNORECASE,
+)
+WRITE_PROCS = re.compile(
+    r"\b(apoc\.(create|merge|refactor|periodic|trigger|import|load)|"
+    r"db\.(create|awaitIndex|index\.fulltext\.(create|drop))|dbms\.(security|killQuery))",
+    re.IGNORECASE,
+)
+LUCENE_SPECIALS = re.compile(r'[+\-&|!(){}\[\]^"~*?:\\/]')
+
+
+def load_env_file(path: Path) -> dict:
+    out = {}
+    try:
+        for line in path.read_text(errors="replace").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, _, v = line.partition("=")
+            out[k.strip()] = v.strip().strip("'").strip('"')
+    except OSError:
+        pass
+    return out
+
+
+def resolve_credentials() -> tuple[str, str, str]:
+    uri = os.environ.get("NEO4J_URI")
+    user = os.environ.get("NEO4J_USER")
+    pwd = os.environ.get("NEO4J_PASSWORD")
+    if not (uri and user and pwd):
+        for cand in ENV_CANDIDATES:
+            if not cand.exists():
+                continue
+            env = load_env_file(cand)
+            uri = uri or env.get("NEO4J_URI")
+            user = user or env.get("NEO4J_USER")
+            pwd = pwd or env.get("NEO4J_PASSWORD")
+            if uri and user and pwd:
+                break
+    if not (uri and user and pwd):
+        sys.exit(
+            "Could not resolve Neo4j credentials.\n"
+            "Set NEO4J_URI / NEO4J_USER / NEO4J_PASSWORD, or place them in "
+            + " or ".join(str(p) for p in ENV_CANDIDATES)
+        )
+    return uri, user, pwd
+
+
+# --------------------------------------------------------------------------- #
+# Neo4j access
+# --------------------------------------------------------------------------- #
+
+class Graph:
+    def __init__(self, uri: str, user: str, pwd: str):
+        self.driver = GraphDatabase.driver(uri, auth=(user, pwd))
+        self.driver.verify_connectivity()
+
+    def close(self):
+        self.driver.close()
+
+    def read(self, cypher: str, params: dict | None = None, timeout: int = QUERY_TIMEOUT_S):
+        """
+        Run cypher inside a READ transaction and materialise the rows before the
+        transaction closes. Node / Relationship objects are preserved so callers
+        can read labels; jsonable() flattens them at serialisation time.
+        Writes are refused by the server, not just by the lexical guard.
+        """
+        params = params or {}
+        # default_access_mode="READ" makes the driver open the transaction with
+        # Bolt mode 'r'; the server then refuses write clauses inside it.
+        with self.driver.session(default_access_mode="READ") as session:
+            with session.begin_transaction(timeout=timeout) as tx:
+                res = tx.run(cypher, **params)
+                return [{k: rec[k] for k in rec.keys()} for rec in res]
+
+    def one(self, cypher: str, params: dict | None = None, default=None):
+        rows = self.read(cypher, params)
+        return rows[0] if rows else (default if default is not None else {})
+
+
+def jsonable(v):
+    """Coerce neo4j temporal / spatial / graph types into JSON-safe values."""
+    if v is None or isinstance(v, (str, int, float, bool)):
+        return v
+    if isinstance(v, (list, tuple)):
+        return [jsonable(x) for x in v]
+    if isinstance(v, dict):
+        return {k: jsonable(x) for k, x in v.items()}
+    for attr in ("iso_format", "isoformat"):
+        fn = getattr(v, attr, None)
+        if callable(fn):
+            try:
+                return fn()
+            except Exception:
+                pass
+    # neo4j Node / Relationship
+    if hasattr(v, "labels") and hasattr(v, "items"):
+        d = {k: jsonable(x) for k, x in v.items() if k not in DROP_PROPS}
+        d["_labels"] = sorted(v.labels)
+        return d
+    if hasattr(v, "type") and hasattr(v, "items"):
+        d = {k: jsonable(x) for k, x in v.items() if k not in DROP_PROPS}
+        d["_type"] = v.type
+        return d
+    return str(v)
+
+
+# Embeddings are huge and useless in a UI; never ship them to the browser.
+DROP_PROPS = {"name_embedding", "fact_embedding", "summary_embedding"}
+
+# An edge is live at :asof when it had started, had not been superseded by a
+# newer fact (invalid_at), and had not been retracted from the record (expired_at).
+LIVE_PREDICATE = (
+    "(coalesce(r.valid_at, r.created_at) <= datetime($asof)) "
+    "AND (r.invalid_at IS NULL OR r.invalid_at > datetime($asof)) "
+    "AND (r.expired_at IS NULL OR r.expired_at > datetime($asof))"
+)
+
+EDGE_STATE = (
+    "CASE WHEN r.expired_at IS NOT NULL THEN 'expired' "
+    "WHEN r.invalid_at IS NOT NULL THEN 'invalidated' "
+    "ELSE 'live' END"
+)
+
+
+def lucene_safe(q: str) -> str:
+    """Neutralise Lucene syntax, then prefix-match the trailing token."""
+    cleaned = LUCENE_SPECIALS.sub(" ", q or "").strip()
+    if not cleaned:
+        return ""
+    parts = [p for p in cleaned.split() if p]
+    if not parts:
+        return ""
+    parts[-1] = parts[-1] + "*"
+    return " ".join(parts)
+
+
+def guard_cypher(q: str):
+    stripped = re.sub(r"//[^\n]*", " ", q or "")
+    stripped = re.sub(r"/\*.*?\*/", " ", stripped, flags=re.S)
+    if WRITE_TOKENS.search(stripped):
+        raise ValueError("Write clauses are refused. Graphiti Lens is read-only.")
+    if WRITE_PROCS.search(stripped):
+        raise ValueError("That procedure can mutate the graph. Refused.")
+
+
+# --------------------------------------------------------------------------- #
+# Subgraph assembly
+# --------------------------------------------------------------------------- #
+
+NODE_FIELDS = "n.uuid AS uuid, n.name AS name, n.group_id AS group_id, n.summary AS summary, n.created_at AS created_at, labels(n) AS node_labels, n.labels AS entity_types"
+
+INDUCED = """
+MATCH (n:Entity) WHERE n.uuid IN $uuids
+WITH collect(n) AS ns
+CALL {
+  WITH ns
+  UNWIND ns AS a
+  MATCH (a)-[r:RELATES_TO]->(b:Entity) WHERE b IN ns
+  RETURN collect(DISTINCT r) AS rels
+}
+RETURN ns AS nodes, rels
+"""
+
+
+def pack_node(n) -> dict:
+    p = {k: jsonable(v) for k, v in n.items() if k not in DROP_PROPS}
+    labels = sorted(n.labels)
+    kind = "episodic" if "Episodic" in labels else ("community" if "Community" in labels else "entity")
+    return {
+        "id": p.get("uuid"),
+        "name": p.get("name") or "(unnamed)",
+        "kind": kind,
+        "group": p.get("group_id"),
+        "types": p.get("labels") or [],
+        "summary": p.get("summary") or p.get("content") or "",
+        "created_at": p.get("created_at"),
+        "source_description": p.get("source_description"),
+        "valid_at": p.get("valid_at"),
+    }
+
+
+def pack_edge(r, asof: str | None) -> dict:
+    p = {k: jsonable(v) for k, v in r.items() if k not in DROP_PROPS}
+    # invalid_at wins over expired_at: Graphiti commonly stamps BOTH when a fact
+    # is superseded, and "the world changed" is the reading that drives as-of
+    # queries. A bare expired_at (no invalid_at) is a true record retraction.
+    if p.get("invalid_at"):
+        state = "invalidated"
+    elif p.get("expired_at"):
+        state = "expired"
+    else:
+        state = "live"
+    live = True
+    if asof:
+        start = p.get("valid_at") or p.get("created_at")
+        live = (
+            (start is None or start <= asof)
+            and (not p.get("invalid_at") or p["invalid_at"] > asof)
+            and (not p.get("expired_at") or p["expired_at"] > asof)
+        )
+    return {
+        "id": p.get("uuid"),
+        "source": p.get("source_node_uuid"),
+        "target": p.get("target_node_uuid"),
+        "name": p.get("name") or "RELATES_TO",
+        "fact": p.get("fact") or "",
+        "group": p.get("group_id"),
+        "state": state,
+        "live": live,
+        "created_at": p.get("created_at"),
+        "valid_at": p.get("valid_at"),
+        "invalid_at": p.get("invalid_at"),
+        "expired_at": p.get("expired_at"),
+        "episodes": p.get("episodes") or [],
+    }
+
+
+def induced_subgraph(g: Graph, uuids: list[str], asof: str | None) -> dict:
+    if not uuids:
+        return {"nodes": [], "edges": []}
+    rows = g.read(INDUCED, {"uuids": uuids})
+    if not rows:
+        return {"nodes": [], "edges": []}
+    nodes = [pack_node(n) for n in rows[0]["nodes"]]
+    present = {n["id"] for n in nodes}
+    edges = [pack_edge(r, asof) for r in (rows[0]["rels"] or [])]
+    edges = [e for e in edges if e["source"] in present and e["target"] in present]
+    deg = {}
+    for e in edges:
+        deg[e["source"]] = deg.get(e["source"], 0) + 1
+        deg[e["target"]] = deg.get(e["target"], 0) + 1
+    for n in nodes:
+        n["degree"] = deg.get(n["id"], 0)
+    return {"nodes": nodes, "edges": edges}
+
+
+# --------------------------------------------------------------------------- #
+# API endpoints
+# --------------------------------------------------------------------------- #
+
+def api_meta(g: Graph, q) -> dict:
+    groups = g.read(
+        "MATCH (n:Entity) WITH n.group_id AS g, count(*) AS entities "
+        "RETURN g AS group, entities ORDER BY entities DESC"
+    )
+    eps = {r["group"]: r for r in g.read(
+        "MATCH (e:Episodic) WITH e.group_id AS g, count(*) AS episodes, max(e.created_at) AS last "
+        "RETURN g AS group, episodes, last"
+    )}
+    edges = {r["group"]: r for r in g.read(
+        "MATCH ()-[r:RELATES_TO]->() WITH r.group_id AS g, count(r) AS edges "
+        "RETURN g AS group, edges"
+    )}
+    out = []
+    for row in groups:
+        gid = row["group"]
+        e = eps.get(gid, {})
+        out.append({
+            "group": gid,
+            "entities": row["entities"],
+            "episodes": e.get("episodes", 0),
+            "edges": edges.get(gid, {}).get("edges", 0),
+            "last_episode": jsonable(e.get("last")),
+        })
+    totals = g.one(
+        "MATCH (n:Entity) WITH count(n) AS entities "
+        "MATCH (e:Episodic) WITH entities, count(e) AS episodes "
+        "OPTIONAL MATCH (c:Community) WITH entities, episodes, count(c) AS communities "
+        "MATCH ()-[r:RELATES_TO]->() RETURN entities, episodes, communities, count(r) AS edges"
+    )
+    types = g.read(
+        "MATCH (n:Entity) WHERE n.labels IS NOT NULL UNWIND n.labels AS t "
+        "RETURN t AS type, count(*) AS c ORDER BY c DESC LIMIT 40"
+    )
+    span = g.one(
+        "MATCH (e:Episodic) RETURN min(e.created_at) AS first, max(e.created_at) AS last"
+    )
+    return {
+        "groups": out,
+        "totals": {k: jsonable(v) for k, v in totals.items()},
+        "entity_types": [{"type": r["type"], "count": r["c"]} for r in types],
+        "span": {k: jsonable(v) for k, v in span.items()},
+        "server_now": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+def api_search(g: Graph, q) -> dict:
+    term = (q.get("q", [""])[0] or "").strip()
+    group = q.get("group", [None])[0] or None
+    kind = (q.get("kind", ["entity"])[0] or "entity").lower()
+    limit = clamp_int(q.get("limit", ["40"])[0], 1, 300, 40)
+    lq = lucene_safe(term)
+    if not lq:
+        return {"results": [], "note": "empty query"}
+
+    idx, call, yields = {
+        "entity": ("node_name_and_summary", "queryNodes", "node"),
+        "episode": ("episode_content", "queryNodes", "node"),
+        "fact": ("edge_name_and_fact", "queryRelationships", "relationship"),
+    }.get(kind, ("node_name_and_summary", "queryNodes", "node"))
+
+    cypher = (
+        f"CALL db.index.fulltext.{call}('{idx}', $q) YIELD {yields} AS x, score "
+        "WHERE ($group IS NULL OR x.group_id = $group) "
+        "RETURN x, score LIMIT $limit"
+    )
+    try:
+        rows = g.read(cypher, {"q": lq, "group": group, "limit": limit})
+    except Neo4jError:
+        # Fulltext unavailable or malformed - fall back to a bounded scan.
+        label = "Episodic" if kind == "episode" else "Entity"
+        rows = g.read(
+            f"MATCH (x:{label}) WHERE ($group IS NULL OR x.group_id = $group) "
+            "AND toLower(coalesce(x.name,'') + ' ' + coalesce(x.summary, x.content, '')) "
+            "CONTAINS toLower($t) RETURN x, 0.0 AS score LIMIT $limit",
+            {"t": term, "group": group, "limit": limit},
+        )
+    results = []
+    for r in rows:
+        x = r["x"]
+        if kind == "fact":
+            item = pack_edge(x, None)
+            item["label"] = item["fact"] or item["name"]
+        else:
+            item = pack_node(x)
+            item["label"] = item["name"]
+        item["score"] = round(float(r.get("score") or 0), 4)
+        results.append(item)
+    return {"results": results, "kind": kind, "query": term}
+
+
+def api_ego(g: Graph, q) -> dict:
+    uuid = q.get("uuid", [""])[0]
+    if not uuid:
+        raise ValueError("uuid is required")
+    depth = clamp_int(q.get("depth", ["1"])[0], 1, 3, 1)
+    limit = clamp_int(q.get("limit", [str(DEFAULT_NODE_BUDGET)])[0], 10, 8000, DEFAULT_NODE_BUDGET)
+    asof = q.get("asof", [None])[0] or None
+    rows = g.read(
+        f"MATCH (a:Entity {{uuid: $uuid}}) "
+        f"OPTIONAL MATCH (a)-[:RELATES_TO*1..{depth}]-(b:Entity) "
+        "WITH a, collect(DISTINCT b.uuid)[0..$limit] AS nbrs "
+        "RETURN [a.uuid] + nbrs AS uuids",
+        {"uuid": uuid, "limit": limit},
+    )
+    uuids = rows[0]["uuids"] if rows else [uuid]
+    sub = induced_subgraph(g, [u for u in uuids if u], asof)
+    sub["focus"] = uuid
+    return sub
+
+
+def api_group(g: Graph, q) -> dict:
+    group = q.get("group", [None])[0] or None
+    limit = clamp_int(q.get("limit", [str(DEFAULT_NODE_BUDGET)])[0], 10, 8000, DEFAULT_NODE_BUDGET)
+    asof = q.get("asof", [None])[0] or None
+    order = "n.created_at DESC" if q.get("order", ["degree"])[0] == "recent" else "deg DESC"
+    rows = g.read(
+        "MATCH (n:Entity) WHERE ($group IS NULL OR n.group_id = $group) "
+        "OPTIONAL MATCH (n)-[r:RELATES_TO]-() "
+        "WITH n, count(r) AS deg "
+        f"RETURN n.uuid AS uuid ORDER BY {order} LIMIT $limit",
+        {"group": group, "limit": limit},
+    )
+    sub = induced_subgraph(g, [r["uuid"] for r in rows], asof)
+    sub["truncated"] = len(rows) >= limit
+    return sub
+
+
+def api_node(g: Graph, q) -> dict:
+    uuid = q.get("uuid", [""])[0]
+    if not uuid:
+        raise ValueError("uuid is required")
+    node = g.one("MATCH (n) WHERE n.uuid = $uuid RETURN n", {"uuid": uuid})
+    if not node:
+        raise KeyError("node not found")
+    packed = pack_node(node["n"])
+    facts = g.read(
+        "MATCH (a:Entity {uuid:$uuid})-[r:RELATES_TO]-(b:Entity) "
+        "RETURN r, b.uuid AS other_id, b.name AS other, "
+        "(startNode(r).uuid = $uuid) AS outgoing "
+        "ORDER BY coalesce(r.valid_at, r.created_at) DESC LIMIT 400",
+        {"uuid": uuid},
+    )
+    packed["facts"] = [
+        dict(pack_edge(r["r"], None), other=r["other"], other_id=r["other_id"], outgoing=r["outgoing"])
+        for r in facts
+    ]
+    eps = g.read(
+        "MATCH (e:Episodic)-[:MENTIONS]->(n:Entity {uuid:$uuid}) "
+        "RETURN e.uuid AS uuid, e.name AS name, e.created_at AS created_at, "
+        "e.source_description AS source_description, left(coalesce(e.content,''), 400) AS excerpt "
+        "ORDER BY e.created_at DESC LIMIT 50",
+        {"uuid": uuid},
+    )
+    packed["episodes"] = [{k: jsonable(v) for k, v in r.items()} for r in eps]
+    return packed
+
+
+def api_episodes(g: Graph, q) -> dict:
+    group = q.get("group", [None])[0] or None
+    limit = clamp_int(q.get("limit", ["100"])[0], 1, 500, 100)
+    rows = g.read(
+        "MATCH (e:Episodic) WHERE ($group IS NULL OR e.group_id = $group) "
+        "OPTIONAL MATCH (e)-[:MENTIONS]->(n:Entity) "
+        "WITH e, count(n) AS mentions "
+        "RETURN e.uuid AS uuid, e.name AS name, e.group_id AS group, e.created_at AS created_at, "
+        "e.valid_at AS valid_at, e.source AS source, e.source_description AS source_description, "
+        "mentions, size(coalesce(e.entity_edges, [])) AS edge_count, "
+        "left(coalesce(e.content,''), 240) AS excerpt, "
+        "(coalesce(e.content,'') STARTS WITH 'OBSERVED:' OR coalesce(e.content,'') STARTS WITH 'DERIVED:') AS tagged "
+        "ORDER BY e.created_at DESC LIMIT $limit",
+        {"group": group, "limit": limit},
+    )
+    return {"episodes": [{k: jsonable(v) for k, v in r.items()} for r in rows]}
+
+
+def api_episode(g: Graph, q) -> dict:
+    uuid = q.get("uuid", [""])[0]
+    if not uuid:
+        raise ValueError("uuid is required")
+    row = g.one("MATCH (e:Episodic {uuid:$uuid}) RETURN e", {"uuid": uuid})
+    if not row:
+        raise KeyError("episode not found")
+    ep = {k: jsonable(v) for k, v in row["e"].items() if k not in DROP_PROPS}
+    ents = g.read(
+        "MATCH (e:Episodic {uuid:$uuid})-[:MENTIONS]->(n:Entity) RETURN n.uuid AS uuid",
+        {"uuid": uuid},
+    )
+    uuids = [r["uuid"] for r in ents]
+    sub = induced_subgraph(g, uuids, None)
+    derived = g.read(
+        "MATCH ()-[r:RELATES_TO]->() WHERE $uuid IN coalesce(r.episodes, []) RETURN r LIMIT 500",
+        {"uuid": uuid},
+    )
+    ep["derived_edges"] = [pack_edge(r["r"], None) for r in derived]
+    ep["extracted_count"] = len(uuids)
+    ep["graph"] = sub
+    ep["provenance_ok"] = bool(
+        (ep.get("content") or "").startswith("OBSERVED:")
+        or (ep.get("content") or "").startswith("DERIVED:")
+    )
+    return ep
+
+
+def api_bridges(g: Graph, q) -> dict:
+    min_groups = clamp_int(q.get("min_groups", ["2"])[0], 2, 10, 2)
+    limit = clamp_int(q.get("limit", ["150"])[0], 1, 500, 150)
+    rows = g.read(
+        "MATCH (n:Entity) WHERE n.name IS NOT NULL "
+        "WITH toLower(trim(n.name)) AS key, collect(DISTINCT n.group_id) AS groups, "
+        "     collect(n.uuid) AS uuids, collect(n.name)[0] AS display "
+        "WHERE size(groups) >= $min_groups "
+        "RETURN key, display, groups, size(groups) AS group_count, uuids, size(uuids) AS node_count "
+        "ORDER BY group_count DESC, node_count DESC LIMIT $limit",
+        {"min_groups": min_groups, "limit": limit},
+    )
+    return {"bridges": [{k: jsonable(v) for k, v in r.items()} for r in rows]}
+
+
+def api_bridge_graph(g: Graph, q) -> dict:
+    key = (q.get("key", [""])[0] or "").strip().lower()
+    if not key:
+        raise ValueError("key is required")
+    hops = clamp_int(q.get("hops", ["1"])[0], 0, 2, 1)
+    limit = clamp_int(q.get("limit", ["600"])[0], 10, 4000, 600)
+    asof = q.get("asof", [None])[0] or None
+    if hops == 0:
+        rows = g.read(
+            "MATCH (n:Entity) WHERE toLower(trim(n.name)) = $key RETURN collect(n.uuid) AS uuids",
+            {"key": key},
+        )
+    else:
+        rows = g.read(
+            f"MATCH (a:Entity) WHERE toLower(trim(a.name)) = $key "
+            f"OPTIONAL MATCH (a)-[:RELATES_TO*1..{hops}]-(b:Entity) "
+            "WITH collect(DISTINCT a.uuid) AS anchors, collect(DISTINCT b.uuid) AS nbrs "
+            "RETURN anchors + nbrs[0..$limit] AS uuids",
+            {"key": key, "limit": limit},
+        )
+    uuids = [u for u in (rows[0]["uuids"] if rows else []) if u]
+    sub = induced_subgraph(g, uuids, asof)
+    sub["anchor_key"] = key
+    return sub
+
+
+def pct(num, den):
+    return round(100.0 * num / den, 1) if den else 0.0
+
+
+def api_health(g: Graph, q) -> dict:
+    """
+    Audit metrics for the graph, scoped to one group_id or the whole store.
+    Stable JSON shape - safe to consume from a scheduled drift check:
+        curl -s -H "X-Lens-Token: $TOK" 'http://127.0.0.1:7878/api/health'
+    """
+    group = q.get("group", [None])[0] or None
+    p = {"group": group}
+
+    edges = g.one(
+        "MATCH ()-[r:RELATES_TO]->() WHERE ($group IS NULL OR r.group_id = $group) "
+        "RETURN count(r) AS total, count(r.valid_at) AS with_valid_at, "
+        "count(r.invalid_at) AS invalidated, count(r.expired_at) AS expired, "
+        "sum(CASE WHEN r.invalid_at IS NOT NULL AND r.expired_at IS NULL THEN 1 ELSE 0 END) AS invalid_only, "
+        "sum(CASE WHEN r.expired_at IS NOT NULL AND r.invalid_at IS NULL THEN 1 ELSE 0 END) AS expired_only, "
+        "sum(CASE WHEN r.expired_at IS NOT NULL AND r.invalid_at IS NOT NULL THEN 1 ELSE 0 END) AS both_stamped, "
+        "sum(CASE WHEN r.valid_at IS NOT NULL AND r.invalid_at IS NOT NULL AND r.invalid_at < r.valid_at THEN 1 ELSE 0 END) AS incoherent, "
+        "sum(CASE WHEN r.fact IS NULL OR trim(r.fact) = '' THEN 1 ELSE 0 END) AS missing_fact, "
+        "sum(CASE WHEN size(coalesce(r.episodes, [])) = 0 THEN 1 ELSE 0 END) AS unsourced_edges",
+        p,
+    )
+    episodes = g.one(
+        "MATCH (e:Episodic) WHERE ($group IS NULL OR e.group_id = $group) "
+        "RETURN count(e) AS total, "
+        "sum(CASE WHEN coalesce(e.content,'') STARTS WITH 'OBSERVED:' THEN 1 ELSE 0 END) AS observed, "
+        "sum(CASE WHEN coalesce(e.content,'') STARTS WITH 'DERIVED:' THEN 1 ELSE 0 END) AS derived, "
+        "sum(CASE WHEN e.source_description IS NULL OR trim(e.source_description) = '' THEN 1 ELSE 0 END) AS no_source_desc, "
+        "max(e.created_at) AS last_ingest",
+        p,
+    )
+    ents = g.one(
+        "MATCH (n:Entity) WHERE ($group IS NULL OR n.group_id = $group) "
+        "RETURN count(n) AS total, "
+        "sum(CASE WHEN n.summary IS NULL OR trim(n.summary) = '' THEN 1 ELSE 0 END) AS no_summary",
+        p,
+    )
+    orphans = g.one(
+        "MATCH (n:Entity) WHERE ($group IS NULL OR n.group_id = $group) "
+        "AND NOT (n)-[:RELATES_TO]-() RETURN count(n) AS c", p
+    ).get("c", 0)
+    unmentioned = g.one(
+        "MATCH (n:Entity) WHERE ($group IS NULL OR n.group_id = $group) "
+        "AND NOT (:Episodic)-[:MENTIONS]->(n) RETURN count(n) AS c", p
+    ).get("c", 0)
+    barren = g.one(
+        "MATCH (e:Episodic) WHERE ($group IS NULL OR e.group_id = $group) "
+        "AND NOT (e)-[:MENTIONS]->() RETURN count(e) AS c", p
+    ).get("c", 0)
+    dupes = g.one(
+        "MATCH (n:Entity) WHERE ($group IS NULL OR n.group_id = $group) AND n.name IS NOT NULL "
+        "WITH n.group_id AS g, toLower(trim(n.name)) AS k, count(*) AS c WHERE c > 1 "
+        "RETURN count(*) AS clusters, sum(c - 1) AS redundant", p
+    )
+    dupe_rows = g.read(
+        "MATCH (n:Entity) WHERE ($group IS NULL OR n.group_id = $group) AND n.name IS NOT NULL "
+        "WITH n.group_id AS g, toLower(trim(n.name)) AS k, count(*) AS c, collect(n.name)[0] AS display "
+        "WHERE c > 1 RETURN g AS group, display, c AS copies ORDER BY c DESC LIMIT 40", p
+    )
+    daily = g.read(
+        "MATCH (e:Episodic) WHERE ($group IS NULL OR e.group_id = $group) "
+        "AND e.created_at >= datetime() - duration({days: 60}) "
+        "RETURN date(e.created_at) AS day, count(*) AS c ORDER BY day", p
+    )
+    stale = g.read(
+        "MATCH (e:Episodic) WITH e.group_id AS g, max(e.created_at) AS last, count(*) AS episodes "
+        "RETURN g AS group, last, episodes ORDER BY last ASC LIMIT 40"
+    )
+
+    et, ep_t = edges.get("total", 0) or 0, episodes.get("total", 0) or 0
+    en_t = ents.get("total", 0) or 0
+    tagged = (episodes.get("observed", 0) or 0) + (episodes.get("derived", 0) or 0)
+
+    checks = [
+        {"id": "provenance_tag", "label": "Episodes tagged OBSERVED:/DERIVED:",
+         "value": pct(tagged, ep_t), "unit": "%", "good": 95, "warn": 70,
+         "detail": f"{tagged} of {ep_t} episodes"},
+        {"id": "source_desc", "label": "Episodes with a source_description",
+         "value": pct(ep_t - (episodes.get("no_source_desc", 0) or 0), ep_t), "unit": "%",
+         "good": 99, "warn": 90,
+         "detail": f"{episodes.get('no_source_desc', 0)} missing"},
+        {"id": "valid_at", "label": "Edges carrying valid_at",
+         "value": pct(edges.get("with_valid_at", 0) or 0, et), "unit": "%", "good": 90, "warn": 60,
+         "detail": f"{et - (edges.get('with_valid_at', 0) or 0)} edges have no start time"},
+        {"id": "edge_sourced", "label": "Edges linked to a source episode",
+         "value": pct(et - (edges.get("unsourced_edges", 0) or 0), et), "unit": "%",
+         "good": 99, "warn": 95,
+         "detail": f"{edges.get('unsourced_edges', 0)} unsourced"},
+        {"id": "entity_connected", "label": "Entities with at least one fact",
+         "value": pct(en_t - orphans, en_t), "unit": "%", "good": 90, "warn": 75,
+         "detail": f"{orphans} orphan entities"},
+        # CORRECTION 2026-08-28. The previous check here rewarded edges that carried
+        # only ONE of invalid_at / expired_at, on the theory that stamping both was a
+        # conflation. That was wrong. They are different axes: invalid_at is valid time
+        # (when the fact stopped being true in the world) and expired_at is transaction
+        # time (when the record stopped being current). A superseded fact SHOULD carry
+        # both. Measured on this graph: 19,161 edges carry both and ZERO hold the same
+        # value - mean separation 15 days, max 38 years. The model is correct; the old
+        # check reported a permanent false critical.
+        {"id": "supersession_complete", "label": "Superseded facts recording both valid- and transaction-time",
+         "value": pct(edges.get("both_stamped", 0) or 0, max(1, edges.get("invalidated", 0) or 0)),
+         "unit": "%", "good": 95, "warn": 80,
+         "detail": f"{edges.get('both_stamped', 0):,} of {edges.get('invalidated', 0):,} superseded edges "
+                   f"carry invalid_at (world time) and expired_at (record time)"},
+        {"id": "temporal_coherence", "label": "Facts whose end date follows their start date",
+         "value": pct(et - (edges.get("incoherent", 0) or 0), et), "unit": "%", "good": 100, "warn": 99,
+         "detail": f"{edges.get('incoherent', 0)} edges claim invalid_at earlier than valid_at, "
+                   f"which is impossible"},
+        {"id": "dedup", "label": "Entities free of same-name duplicates",
+         "value": pct(en_t - (dupes.get("redundant", 0) or 0), en_t), "unit": "%",
+         "good": 99, "warn": 95,
+         "detail": f"{dupes.get('redundant', 0)} redundant across {dupes.get('clusters', 0)} name clusters"},
+    ]
+    for c in checks:
+        c["status"] = "good" if c["value"] >= c["good"] else ("warning" if c["value"] >= c["warn"] else "critical")
+
+    return {
+        "group": group,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "totals": {"entities": en_t, "episodes": ep_t, "edges": et},
+        "bitemporal": {
+            "total": et,
+            "with_valid_at": edges.get("with_valid_at", 0),
+            "invalidated": edges.get("invalidated", 0),
+            "expired": edges.get("expired", 0),
+            "invalid_only": edges.get("invalid_only", 0),
+            "expired_only": edges.get("expired_only", 0),
+            "both_stamped": edges.get("both_stamped", 0),
+            "incoherent": edges.get("incoherent", 0),
+            "live": et - (edges.get("invalidated", 0) or 0) - (edges.get("expired_only", 0) or 0),
+            "missing_fact": edges.get("missing_fact", 0),
+        },
+        "provenance": {
+            "observed": episodes.get("observed", 0),
+            "derived": episodes.get("derived", 0),
+            "untagged": ep_t - tagged,
+            "no_source_description": episodes.get("no_source_desc", 0),
+            "last_ingest": jsonable(episodes.get("last_ingest")),
+        },
+        "hygiene": {
+            "orphan_entities": orphans,
+            "unmentioned_entities": unmentioned,
+            "episodes_with_no_entities": barren,
+            "entities_without_summary": ents.get("no_summary", 0),
+            "duplicate_clusters": dupes.get("clusters", 0),
+            "redundant_entities": dupes.get("redundant", 0),
+        },
+        "checks": checks,
+        "duplicates": [{k: jsonable(v) for k, v in r.items()} for r in dupe_rows],
+        "ingest_daily": [{"day": jsonable(r["day"]), "count": r["c"]} for r in daily],
+        "group_staleness": [{k: jsonable(v) for k, v in r.items()} for r in stale],
+    }
+
+
+def api_cypher(g: Graph, body: dict) -> dict:
+    query = (body.get("query") or "").strip()
+    if not query:
+        raise ValueError("query is required")
+    guard_cypher(query)
+    limit = clamp_int(str(body.get("limit", 500)), 1, MAX_ROWS, 500)
+    rows = g.read(query, {}, timeout=QUERY_TIMEOUT_S)
+    truncated = len(rows) > limit
+    rows = rows[:limit]
+    columns = list(rows[0].keys()) if rows else []
+
+    # If the result carries graph elements, assemble a renderable subgraph too.
+    nodes, edges, seen_n, seen_e = [], [], set(), set()
+    for row in rows:
+        for v in row.values():
+            items = v if isinstance(v, (list, tuple)) else [v]
+            for it in items:
+                if hasattr(it, "labels") and hasattr(it, "items"):
+                    n = pack_node(it)
+                    if n["id"] and n["id"] not in seen_n:
+                        seen_n.add(n["id"]); nodes.append(n)
+                elif hasattr(it, "type") and hasattr(it, "items"):
+                    e = pack_edge(it, None)
+                    if e["id"] and e["id"] not in seen_e:
+                        seen_e.add(e["id"]); edges.append(e)
+    edges = [e for e in edges if e["source"] in seen_n and e["target"] in seen_n]
+    deg = {}
+    for e in edges:
+        deg[e["source"]] = deg.get(e["source"], 0) + 1
+        deg[e["target"]] = deg.get(e["target"], 0) + 1
+    for n in nodes:
+        n["degree"] = deg.get(n["id"], 0)
+
+    return {
+        "columns": columns,
+        "rows": [{k: jsonable(v) for k, v in r.items()} for r in rows],
+        "row_count": len(rows),
+        "truncated": truncated,
+        "graph": {"nodes": nodes, "edges": edges} if nodes else None,
+    }
+
+
+def clamp_int(raw, lo: int, hi: int, default: int) -> int:
+    try:
+        return max(lo, min(hi, int(str(raw).strip())))
+    except (TypeError, ValueError):
+        return default
+
+
+ROUTES = {
+    "/api/meta": api_meta,
+    "/api/search": api_search,
+    "/api/ego": api_ego,
+    "/api/group": api_group,
+    "/api/node": api_node,
+    "/api/episodes": api_episodes,
+    "/api/episode": api_episode,
+    "/api/bridges": api_bridges,
+    "/api/bridge_graph": api_bridge_graph,
+    "/api/health": api_health,
+}
+
+CONTENT_TYPES = {
+    ".html": "text/html; charset=utf-8",
+    ".js": "text/javascript; charset=utf-8",
+    ".css": "text/css; charset=utf-8",
+    ".svg": "image/svg+xml",
+    ".json": "application/json",
+}
+
+
+class Handler(BaseHTTPRequestHandler):
+    server_version = "GraphitiLens"
+    protocol_version = "HTTP/1.1"
+
+    # -- plumbing ----------------------------------------------------------- #
+    def log_message(self, fmt, *args):
+        if self.server.verbose:
+            sys.stderr.write("  %s\n" % (fmt % args))
+
+    def _send(self, code: int, payload: bytes, ctype: str, extra: dict | None = None):
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(payload)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Referrer-Policy", "no-referrer")
+        for k, v in (extra or {}).items():
+            self.send_header(k, v)
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def _json(self, code: int, obj):
+        self._send(code, json.dumps(jsonable(obj), default=str).encode(), "application/json")
+
+    def _authorised(self, query) -> bool:
+        token = self.server.token
+        if not token:
+            return True
+        supplied = self.headers.get("X-Lens-Token") or (query.get("t", [None])[0])
+        return secrets.compare_digest(str(supplied or ""), token)
+
+    # -- routing ------------------------------------------------------------ #
+    def do_GET(self):
+        parsed = urlparse(self.path)
+        query = parse_qs(parsed.query)
+        path = parsed.path
+
+        if not self._authorised(query):
+            return self._json(401, {"error": "bad or missing token"})
+
+        if path.startswith("/api/"):
+            fn = ROUTES.get(path)
+            if not fn:
+                return self._json(404, {"error": "no such endpoint"})
+            try:
+                return self._json(200, fn(self.server.graph, query))
+            except KeyError as exc:
+                return self._json(404, {"error": str(exc)})
+            except ValueError as exc:
+                return self._json(400, {"error": str(exc)})
+            except Neo4jError as exc:
+                return self._json(400, {"error": f"Neo4j: {exc.message}", "code": exc.code})
+            except Exception as exc:  # pragma: no cover
+                return self._json(500, {"error": f"{type(exc).__name__}: {exc}"})
+
+        return self._serve_static(path)
+
+    def do_POST(self):
+        parsed = urlparse(self.path)
+        query = parse_qs(parsed.query)
+        if not self._authorised(query):
+            return self._json(401, {"error": "bad or missing token"})
+        if parsed.path != "/api/cypher":
+            return self._json(404, {"error": "no such endpoint"})
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+            if length > 200_000:
+                return self._json(413, {"error": "query too large"})
+            body = json.loads(self.rfile.read(length) or b"{}")
+            return self._json(200, api_cypher(self.server.graph, body))
+        except ValueError as exc:
+            return self._json(400, {"error": str(exc)})
+        except Neo4jError as exc:
+            return self._json(400, {"error": f"Neo4j: {exc.message}", "code": exc.code})
+        except Exception as exc:  # pragma: no cover
+            return self._json(500, {"error": f"{type(exc).__name__}: {exc}"})
+
+    def _serve_static(self, path: str):
+        rel = "index.html" if path in ("/", "") else path.lstrip("/")
+        target = (STATIC / rel).resolve()
+        try:
+            target.relative_to(STATIC.resolve())
+        except ValueError:
+            return self._json(403, {"error": "forbidden"})
+        if not target.is_file():
+            return self._json(404, {"error": "not found"})
+        ctype = CONTENT_TYPES.get(target.suffix, "application/octet-stream")
+        self._send(200, target.read_bytes(), ctype)
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Graphiti Lens - read-only graph explorer")
+    ap.add_argument("--port", type=int, default=7878)
+    ap.add_argument("--host", default="127.0.0.1", help="loopback by default; change at your own risk")
+    ap.add_argument("--no-token", action="store_true", help="disable the bearer token (loopback only)")
+    ap.add_argument("--no-open", action="store_true", help="do not open a browser")
+    ap.add_argument("--verbose", action="store_true")
+    args = ap.parse_args()
+
+    uri, user, pwd = resolve_credentials()
+    graph = Graph(uri, user, pwd)
+
+    token = "" if args.no_token else secrets.token_urlsafe(18)
+    httpd = ThreadingHTTPServer((args.host, args.port), Handler)
+    httpd.graph = graph
+    httpd.token = token
+    httpd.verbose = args.verbose
+
+    url = f"http://{args.host}:{args.port}/" + (f"?t={token}" if token else "")
+    print("\n  Graphiti Lens")
+    print(f"  neo4j    {uri} as {user}")
+    print(f"  serving  {url}")
+    if token:
+        print(f"  token    {token}   (header: X-Lens-Token)")
+    print("  mode     READ ONLY - write clauses are refused\n  ctrl-c to stop\n")
+    sys.stdout.flush()
+
+    if not args.no_open:
+        threading.Timer(0.6, lambda: webbrowser.open(url)).start()
+    try:
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        print("\n  stopping")
+    finally:
+        httpd.server_close()
+        graph.close()
+
+
+if __name__ == "__main__":
+    main()
