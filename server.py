@@ -927,7 +927,9 @@ def main():
     uri, user, pwd = resolve_credentials()
     graph = Graph(uri, user, pwd)
 
-    token = "" if args.no_token else secrets.token_urlsafe(18)
+    # LENS_TOKEN pins the bearer token across restarts (needed when run as a
+    # LaunchAgent, otherwise the URL changes every boot). Random when unset.
+    token = "" if args.no_token else (os.environ.get("LENS_TOKEN") or secrets.token_urlsafe(18))
     httpd = ThreadingHTTPServer((args.host, args.port), Handler)
     httpd.graph = graph
     httpd.token = token
