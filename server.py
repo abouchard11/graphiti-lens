@@ -958,6 +958,33 @@ def api_explain(g: Graph, q):
     return payload
 
 
+
+EXPIRED_HTML = """<!doctype html><meta charset="utf-8"><title>Graphiti Lens - link expired</title>
+<style>
+ body{background:#101826;color:#e8eef5;font:16px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
+      margin:0;display:flex;min-height:100vh;align-items:center;justify-content:center}
+ main{max-width:34rem;padding:2rem}
+ h1{font-size:1.35rem;font-weight:500;margin:0 0 1rem}
+ p{color:#aab6c6;margin:0 0 1rem}
+ b{color:#e8eef5;font-weight:500}
+ .k{background:#18222f;border:1px solid #2a3648;border-radius:6px;padding:.15rem .45rem;color:#96cddc}
+</style>
+<main>
+<h1>This link has expired.</h1>
+<p>Lens links are <b>single-use</b> and last about 30 seconds, so a copied, bookmarked or
+   reopened URL stops working. That is deliberate: a URL ends up in browser history and in
+   the server's own log, and a credential sitting there outlives the session it was for.</p>
+<p>Open <b>Graphiti Lens</b> instead - on your <span class="k">Desktop</span>, or in
+   <span class="k">/Applications</span>. It mints a fresh link every time, so there is
+   nothing to remember and nothing to keep.</p>
+<p>Keep the app, not the address.</p>
+</main>"""
+
+
+def expired_page() -> str:
+    return EXPIRED_HTML
+
+
 ROUTES = {
     "/api/meta": api_meta,
     "/api/search": api_search,
@@ -1050,6 +1077,10 @@ class Handler(BaseHTTPRequestHandler):
         path = parsed.path
 
         if not self._authorised(query):
+            # A browser asking for the page gets an explanation; everything else gets JSON.
+            wants_html = "text/html" in (self.headers.get("Accept") or "")
+            if wants_html and path in ("/", "/index.html"):
+                return self._send(401, expired_page().encode(), "text/html; charset=utf-8")
             return self._json(401, {"error": "bad or missing token"})
 
         if path in TEXT_ROUTES:

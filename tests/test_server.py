@@ -87,6 +87,28 @@ class TokenFile(unittest.TestCase):
             self.assertFalse(path.exists(), "a stale token file must not outlive --no-token")
 
 
+class ExpiredLink(unittest.TestCase):
+    """A copied or bookmarked lens URL stops working by design. A browser showing raw
+    JSON for that looks like the tool is broken, which is how Alex first hit it."""
+
+    def setUp(self):
+        self.m = load()
+
+    def test_it_explains_itself_in_a_browser(self):
+        html = self.m.expired_page()
+        self.assertIn("expired", html.lower())
+        self.assertIn("Graphiti Lens", html, "it has to name the app that still works")
+
+    def test_it_says_where_the_app_is(self):
+        html = self.m.expired_page()
+        self.assertTrue("Desktop" in html or "Applications" in html)
+
+    def test_it_leaks_nothing(self):
+        html = self.m.expired_page()
+        for leak in ("lens_session", ".lens-token", "X-Lens-Token", "nonce="):
+            self.assertNotIn(leak, html)
+
+
 class ExplainText(unittest.TestCase):
     """The text surface. Every other view of this graph is pixels, which is no use to a
     screen reader, to an agent, or to anyone who does not think in pictures."""
