@@ -4,7 +4,7 @@ A read-only explorer for the Graphiti temporal knowledge graph in `neo4j-graphit
 Nothing off-the-shelf understands Graphiti's bitemporal edges, so this does.
 
 ```bash
-~/dev/graphiti-lens/run.sh          # opens http://127.0.0.1:7878/?t=<token>
+~/dev/graphiti-lens/run.sh          # opens a one-time link (valid 5 min)
 ~/dev/graphiti-lens/run.sh --port 8080 --no-token --no-open
 lsof -ti tcp:7878 | xargs kill     # stop
 ```
@@ -21,6 +21,25 @@ lsof -ti tcp:7878 | xargs kill     # stop
 | **Bridges** | *What connects my projects?* Entities whose name appears in more than one `group_id`. Graphiti dedupes inside a group, never across them, so this is the only place portfolio overlap shows up. Nodes colour by project here. |
 | **Episodes** | *Why did this episode produce these entities?* Timeline of ingests, each showing extracted entities, derived facts, `source_description`, and whether the content carries an `OBSERVED:`/`DERIVED:` tag. |
 | **Cypher** | Free-form read-only Cypher with seven Graphiti-aware recipes. Results render as both a table and a graph when the query returns nodes or relationships. |
+| **`/api/explain`** | The same questions, answered in prose instead of pixels — see below. No UI; it is an endpoint. |
+
+## The text surface
+
+Every other view here is a drawing, which is no use to a screen reader, to an agent with no
+vision, or to anyone who does not think in pictures. `/api/explain` answers the Explore
+question in plain text:
+
+```bash
+TOKEN=$(cat ~/dev/graphiti-lens/.lens-token)
+curl -s -H "X-Lens-Token: $TOKEN" '127.0.0.1:7878/api/explain?entity=Alex&days=14'
+curl -s -H "X-Lens-Token: $TOKEN" '127.0.0.1:7878/api/explain?entity=Alex&format=json'
+```
+
+It returns every node carrying that name and which group each sits in, the strongest facts
+with their state spelled out as a word (`live`, `superseded`, `retracted` — never colour
+alone), what was superseded inside the window, and what was written about it. `format=json`
+returns the same payload as data. Output is plain text with no tabs and no markup, so it
+diffs cleanly and can feed a check rather than only being looked at.
 
 ## The temporal controls
 
@@ -50,7 +69,15 @@ Shape: `totals`, `bitemporal`, `provenance`, `hygiene`, `checks[]` (each with
 
 ## Security model
 
-- Binds `127.0.0.1` only. Per-run bearer token in the URL and the `X-Lens-Token` header.
+- Binds `127.0.0.1` only. The bearer token has exactly one home: `.lens-token`, mode 600,
+  written by the server at startup. It is not in the LaunchAgent plist, not in the log, and
+  never in a URL. A restart rotates it, which is why nothing may cache the old value.
+- **Opening the UI uses a one-time nonce, not the token.** `POST /api/session` with the token
+  in the `X-Lens-Token` header returns a nonce good for one request and 30 seconds; the app
+  opens `/?t=<nonce>`, and the server trades it for an `HttpOnly; SameSite=Strict` session
+  cookie. Anything a URL leaks into — browser history, this server's log, a screen share —
+  therefore holds a credential that was already dead when it was written. `run.sh` prints a
+  5-minute nonce for the same reason.
 - Neo4j credentials are resolved server-side from the environment or
   `~/dev/graphiti/mcp_server/.env`. They never reach the browser.
 - **Every** query runs in a Neo4j READ transaction. A write is refused by the database

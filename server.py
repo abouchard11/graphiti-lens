@@ -16,7 +16,9 @@ import argparse
 import json
 import os
 import re
+import pathlib
 import secrets
+import time
 import sys
 import threading
 import webbrowser
@@ -803,6 +805,159 @@ def clamp_int(raw, lo: int, hi: int, default: int) -> int:
         return default
 
 
+
+# --- one-time nonces -------------------------------------------------------- #
+# The launcher must hand the browser something to authenticate with, and anything
+# in a URL survives in browser history and in this server's own log. So it hands
+# over a nonce instead: single-use, seconds-scale, and dead by the time anyone
+# reads it back. The long-lived token never leaves its 0600 file.
+
+NONCE_TTL = 30
+TOKEN_FILE = HERE / ".lens-token"
+
+
+def write_token_file(path, token: str) -> None:
+    """The token's single home. Readable only by this user; gone in --no-token mode,
+    so a stale file can never authenticate against a server that has moved on."""
+    path = pathlib.Path(path) if not hasattr(path, "write_text") else path
+    if not token:
+        path.unlink(missing_ok=True)
+        return
+    path.write_text(token)
+    path.chmod(0o600)
+
+
+def issue_nonce(store: dict, now: float, ttl: int = NONCE_TTL) -> str:
+    for value, expiry in list(store.items()):
+        if expiry <= now:
+            del store[value]
+    nonce = secrets.token_urlsafe(18)
+    store[nonce] = now + ttl
+    return nonce
+
+
+def redeem_nonce(store: dict, candidate: str, now: float) -> bool:
+    """True once per nonce, and never after it expires."""
+    if not candidate:
+        return False
+    expiry = store.pop(candidate, None)
+    return expiry is not None and expiry > now
+
+
+# --- the text surface ------------------------------------------------------- #
+
+STATE_WORDS = {"live": "live", "invalidated": "superseded", "expired": "retracted"}
+
+
+def flat(value, width: int) -> str:
+    """One field, one row. Summaries and facts in this graph contain newlines."""
+    text = " ".join(str(value or "").split())
+    return text if len(text) <= width else text[: width - 1] + "\u2026"
+
+
+def format_explain(p: dict) -> str:
+    """Plain text, because every other view of this graph is pixels.
+
+    Readable by a screen reader, by an agent with no vision, and in a terminal;
+    diffable, so it can feed a check instead of only being looked at."""
+    name = p.get("name", "?")
+    instances = p.get("instances") or []
+    if not instances:
+        return f"{name} - nothing in the graph carries this name." + chr(10)
+
+    groups = p.get("groups") or []
+    out = [f"{name} - {len(instances)} node(s) across {len(groups)} groups ({', '.join(groups)})", ""]
+    for i in instances:
+        noun = "fact " if i["facts"] == 1 else "facts"
+        line = f"  {flat(i['group'], 26):<26} {i['uuid'][:8]}  {i['facts']:>4} {noun}"
+        if i.get("summary"):
+            line += f"  {flat(i['summary'], 70)}"
+        out.append(line.rstrip())
+
+    facts = p.get("top_facts") or []
+    if facts:
+        out += ["", "Strongest facts"]
+        for f in facts:
+            word = STATE_WORDS.get(f.get("state", "live"), f.get("state", "live"))
+            when = (f.get("valid_at") or "")[:10]
+            out.append(
+                f"  {word:<11} {flat(f['fact'], 64):<64} {flat(f.get('group'), 20):<20} {when}".rstrip()
+            )
+
+    days = p.get("window_days", 7)
+    out += ["", f"Last {days} days"]
+    changed = p.get("superseded_recently", 0)
+    out.append(f"  {changed} fact(s) stopped being true." if changed else "  No fact was superseded.")
+    for e in p.get("recent_episodes") or []:
+        out.append(
+            f"  {str(e.get('created_at') or '')[:10]}  {flat(e.get('group'), 20):<20} {flat(e.get('name'), 60)}".rstrip()
+        )
+    if not (p.get("recent_episodes") or []):
+        out.append("  Nothing was written about it.")
+    return chr(10).join(out) + "\n"
+
+
+def api_explain(g: Graph, q):
+    name = (q.get("entity", [""])[0] or q.get("name", [""])[0]).strip()
+    if not name:
+        raise ValueError("entity is required")
+    days = clamp_int(q.get("days", ["7"])[0], 1, 365, 7)
+
+    rows = g.read(
+        "MATCH (n:Entity) WHERE toLower(n.name) = toLower($name) "
+        "OPTIONAL MATCH (n)-[r:RELATES_TO]-() "
+        "WITH n, count(r) AS facts "
+        "RETURN n.uuid AS uuid, n.group_id AS group, coalesce(n.summary,'') AS summary, facts "
+        "ORDER BY facts DESC LIMIT 60",
+        {"name": name},
+    )
+    instances = [{k: jsonable(v) for k, v in r.items()} for r in rows]
+    uuids = [i["uuid"] for i in instances]
+    payload = {
+        "name": name,
+        "instances": instances,
+        "groups": sorted({i["group"] for i in instances if i.get("group")}),
+        "top_facts": [],
+        "recent_episodes": [],
+        "superseded_recently": 0,
+        "window_days": days,
+    }
+    if not uuids:
+        return payload
+
+    facts = g.read(
+        "MATCH (a:Entity)-[r:RELATES_TO]-(b:Entity) WHERE a.uuid IN $uuids "
+        "RETURN r.fact AS fact, r.group_id AS group, r.valid_at AS valid_at, "
+        "r.invalid_at AS invalid_at, r.expired_at AS expired_at, r.created_at AS created_at "
+        "ORDER BY coalesce(r.valid_at, r.created_at) DESC LIMIT 25",
+        {"uuids": uuids},
+    )
+    for r in facts:
+        state = "invalidated" if r["invalid_at"] else ("expired" if r["expired_at"] else "live")
+        payload["top_facts"].append({
+            "fact": r["fact"] or "",
+            "group": jsonable(r["group"]) or "",
+            "valid_at": str(jsonable(r["valid_at"]) or jsonable(r["created_at"]) or ""),
+            "state": state,
+        })
+
+    since = f"datetime() - duration('P{days}D')"
+    payload["superseded_recently"] = (g.one(
+        "MATCH (a:Entity)-[r:RELATES_TO]-() WHERE a.uuid IN $uuids "
+        f"AND r.invalid_at IS NOT NULL AND r.invalid_at > {since} "
+        "RETURN count(r) AS n", {"uuids": uuids}) or {}).get("n", 0)
+
+    eps = g.read(
+        "MATCH (e:Episodic)-[:MENTIONS]->(n:Entity) WHERE n.uuid IN $uuids "
+        f"AND e.created_at > {since} "
+        "RETURN DISTINCT e.name AS name, e.group_id AS group, e.created_at AS created_at "
+        "ORDER BY created_at DESC LIMIT 10",
+        {"uuids": uuids},
+    )
+    payload["recent_episodes"] = [{k: jsonable(v) for k, v in r.items()} for r in eps]
+    return payload
+
+
 ROUTES = {
     "/api/meta": api_meta,
     "/api/search": api_search,
@@ -815,6 +970,9 @@ ROUTES = {
     "/api/bridge_graph": api_bridge_graph,
     "/api/health": api_health,
 }
+
+# Answers in prose rather than JSON. Same queries, different surface.
+TEXT_ROUTES = {"/api/explain": api_explain}
 
 CONTENT_TYPES = {
     ".html": "text/html; charset=utf-8",
@@ -839,6 +997,11 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(payload)))
         self.send_header("Cache-Control", "no-store")
+        cookie = getattr(self, "_cookie", None)
+        if cookie:
+            # HttpOnly so page scripts cannot read it back out; SameSite=Strict so a
+            # page on another origin cannot ride it against this loopback service.
+            self.send_header("Set-Cookie", f"lens_session={cookie}; Path=/; HttpOnly; SameSite=Strict")
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Referrer-Policy", "no-referrer")
         for k, v in (extra or {}).items():
@@ -849,12 +1012,36 @@ class Handler(BaseHTTPRequestHandler):
     def _json(self, code: int, obj):
         self._send(code, json.dumps(jsonable(obj), default=str).encode(), "application/json")
 
+    def _session_ok(self) -> bool:
+        for part in (self.headers.get("Cookie") or "").split(";"):
+            key, _, value = part.strip().partition("=")
+            if key == "lens_session" and value and value in self.server.sessions:
+                return True
+        return False
+
     def _authorised(self, query) -> bool:
         token = self.server.token
         if not token:
             return True
-        supplied = self.headers.get("X-Lens-Token") or (query.get("t", [None])[0])
-        return secrets.compare_digest(str(supplied or ""), token)
+        # Cookie first: once the browser holds a session, the dead nonce still sitting
+        # in its URL bar (and in app.js) must not turn every later request into a 401.
+        if self._session_ok():
+            return True
+        supplied = str(self.headers.get("X-Lens-Token") or (query.get("t", [None])[0]) or "")
+        if supplied and secrets.compare_digest(supplied, token):
+            return True
+        return redeem_nonce(self.server.nonces, supplied, time.time())
+
+    def _start_session(self):
+        """Give the page a cookie so its assets and API calls carry no credential."""
+        if not self.server.token or self._session_ok():
+            return
+        sessions = self.server.sessions
+        if len(sessions) > 64:
+            sessions.clear()
+        sid = secrets.token_urlsafe(18)
+        sessions.add(sid)
+        self._cookie = sid
 
     # -- routing ------------------------------------------------------------ #
     def do_GET(self):
@@ -864,6 +1051,17 @@ class Handler(BaseHTTPRequestHandler):
 
         if not self._authorised(query):
             return self._json(401, {"error": "bad or missing token"})
+
+        if path in TEXT_ROUTES:
+            try:
+                payload = TEXT_ROUTES[path](self.server.graph, query)
+            except ValueError as exc:
+                return self._json(400, {"error": str(exc)})
+            except Neo4jError as exc:
+                return self._json(400, {"error": f"Neo4j: {exc.message}", "code": exc.code})
+            if (query.get("format", [""])[0] or "").lower() == "json":
+                return self._json(200, payload)
+            return self._send(200, format_explain(payload).encode(), "text/plain; charset=utf-8")
 
         if path.startswith("/api/"):
             fn = ROUTES.get(path)
@@ -880,6 +1078,8 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as exc:  # pragma: no cover
                 return self._json(500, {"error": f"{type(exc).__name__}: {exc}"})
 
+        if path in ("/", "/index.html"):
+            self._start_session()
         return self._serve_static(path)
 
     def do_POST(self):
@@ -887,6 +1087,14 @@ class Handler(BaseHTTPRequestHandler):
         query = parse_qs(parsed.query)
         if not self._authorised(query):
             return self._json(401, {"error": "bad or missing token"})
+        if parsed.path == "/api/session":
+            # Only the real token may mint a nonce, and only via the header - never a URL.
+            token = self.server.token
+            supplied = str(self.headers.get("X-Lens-Token") or "")
+            if token and not (supplied and secrets.compare_digest(supplied, token)):
+                return self._json(401, {"error": "the header X-Lens-Token must carry the real token"})
+            return self._json(200, {"nonce": issue_nonce(self.server.nonces, time.time()),
+                                    "expires_in": NONCE_TTL})
         if parsed.path != "/api/cypher":
             return self._json(404, {"error": "no such endpoint"})
         try:
@@ -934,13 +1142,22 @@ def main():
     httpd.graph = graph
     httpd.token = token
     httpd.verbose = args.verbose
+    httpd.nonces = {}
+    httpd.sessions = set()
+    # Written here so the file is the one place the token lives: no copy in the
+    # LaunchAgent plist, none in this log. A restart rotates it, and the app reads
+    # the file every time, so nothing needs to know the old value.
+    write_token_file(TOKEN_FILE, token)
 
-    url = f"http://{args.host}:{args.port}/" + (f"?t={token}" if token else "")
+    # The printed URL carries a short-lived nonce, not the token: stdout is the
+    # LaunchAgent's log file, and a token printed there outlives every session.
+    opening = issue_nonce(httpd.nonces, time.time(), ttl=300) if token else ""
+    url = f"http://{args.host}:{args.port}/" + (f"?t={opening}" if token else "")
     print("\n  Graphiti Lens")
     print(f"  neo4j    {uri} as {user}")
-    print(f"  serving  {url}")
+    print(f"  serving  http://{args.host}:{args.port}/")
     if token:
-        print(f"  token    {token}   (header: X-Lens-Token)")
+        print("  opening  one-time link, valid 5 minutes (the token stays in .lens-token)")
     print("  mode     READ ONLY - write clauses are refused\n  ctrl-c to stop\n")
     sys.stdout.flush()
 
