@@ -452,6 +452,19 @@ def api_node(g: Graph, q) -> dict:
     return packed
 
 
+# The provenance tier of an Episodic node `e`. Mirrors TIER_CYPHER in the graphiti MCP server
+# (mcp_server/src/services/scope.py): since 2026-09-15 the server stores the tier on the node
+# right after a write lands; the body prefix is only the fallback for older episodes. Counting
+# by prefix alone read 7.7% here when 98.9% of the week's writes carried a tier.
+TIER_EXPR = (
+    "coalesce(e.tier, CASE "
+    "WHEN coalesce(e.content,'') STARTS WITH 'OBSERVED:' THEN 'observed' "
+    "WHEN coalesce(e.content,'') STARTS WITH 'DERIVED:' THEN 'derived' "
+    "WHEN coalesce(e.content,'') STARTS WITH 'VERIFIED:' THEN 'verified' "
+    "WHEN coalesce(e.content,'') STARTS WITH 'DECIDED:' THEN 'decided' END)"
+)
+
+
 def api_episodes(g: Graph, q) -> dict:
     group = q.get("group", [None])[0] or None
     limit = clamp_int(q.get("limit", ["100"])[0], 1, 500, 100)
@@ -463,7 +476,7 @@ def api_episodes(g: Graph, q) -> dict:
         "e.valid_at AS valid_at, e.source AS source, e.source_description AS source_description, "
         "mentions, size(coalesce(e.entity_edges, [])) AS edge_count, "
         "left(coalesce(e.content,''), 240) AS excerpt, "
-        "(coalesce(e.content,'') STARTS WITH 'OBSERVED:' OR coalesce(e.content,'') STARTS WITH 'DERIVED:') AS tagged "
+        f"{TIER_EXPR} AS tier, {TIER_EXPR} IS NOT NULL AS tagged "
         "ORDER BY e.created_at DESC LIMIT $limit",
         {"group": group, "limit": limit},
     )
@@ -567,8 +580,11 @@ def api_health(g: Graph, q) -> dict:
     episodes = g.one(
         "MATCH (e:Episodic) WHERE ($group IS NULL OR e.group_id = $group) "
         "RETURN count(e) AS total, "
-        "sum(CASE WHEN coalesce(e.content,'') STARTS WITH 'OBSERVED:' THEN 1 ELSE 0 END) AS observed, "
-        "sum(CASE WHEN coalesce(e.content,'') STARTS WITH 'DERIVED:' THEN 1 ELSE 0 END) AS derived, "
+        f"sum(CASE WHEN {TIER_EXPR} = 'observed' THEN 1 ELSE 0 END) AS observed, "
+        f"sum(CASE WHEN {TIER_EXPR} = 'derived' THEN 1 ELSE 0 END) AS derived, "
+        f"sum(CASE WHEN {TIER_EXPR} = 'verified' THEN 1 ELSE 0 END) AS verified, "
+        f"sum(CASE WHEN {TIER_EXPR} = 'decided' THEN 1 ELSE 0 END) AS decided, "
+        f"sum(CASE WHEN {TIER_EXPR} IS NOT NULL THEN 1 ELSE 0 END) AS tagged, "
         "sum(CASE WHEN e.source_description IS NULL OR trim(e.source_description) = '' THEN 1 ELSE 0 END) AS no_source_desc, "
         "max(e.created_at) AS last_ingest",
         p,
@@ -646,10 +662,10 @@ def api_health(g: Graph, q) -> dict:
 
     et, ep_t = edges.get("total", 0) or 0, episodes.get("total", 0) or 0
     en_t = ents.get("total", 0) or 0
-    tagged = (episodes.get("observed", 0) or 0) + (episodes.get("derived", 0) or 0)
+    tagged = episodes.get("tagged", 0) or 0
 
     checks = [
-        {"id": "provenance_tag", "label": "Episodes tagged OBSERVED:/DERIVED:",
+        {"id": "provenance_tag", "label": "Episodes carrying a provenance tier",
          "value": pct(tagged, ep_t), "unit": "%", "good": 95, "warn": 70,
          "detail": f"{tagged} of {ep_t} episodes"},
         {"id": "source_desc", "label": "Episodes with a source_description",
@@ -730,6 +746,8 @@ def api_health(g: Graph, q) -> dict:
         "provenance": {
             "observed": episodes.get("observed", 0),
             "derived": episodes.get("derived", 0),
+            "verified": episodes.get("verified", 0),
+            "decided": episodes.get("decided", 0),
             "untagged": ep_t - tagged,
             "no_source_description": episodes.get("no_source_desc", 0),
             "last_ingest": jsonable(episodes.get("last_ingest")),

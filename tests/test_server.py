@@ -171,3 +171,18 @@ class ExplainText(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TheProvenanceTierIsReadFromTheNodeFirst(unittest.TestCase):
+    """2026-09-15: the MCP server stores the tier on the Episodic node; a prefix-only count
+    read 7.7% critical while 98.9% of the week's writes carried a tier."""
+
+    def test_the_expression_reads_the_stored_tier_before_any_prefix(self):
+        mod = load()
+        self.assertTrue(mod.TIER_EXPR.startswith("coalesce(e.tier"))
+        for prefix in ("OBSERVED:", "DERIVED:", "VERIFIED:", "DECIDED:"):
+            self.assertIn(prefix, mod.TIER_EXPR)
+
+    def test_no_query_keeps_a_prefix_check_of_its_own(self):
+        src = (Path(__file__).resolve().parent.parent / "server.py").read_text()
+        self.assertEqual(src.count("STARTS WITH 'OBSERVED:'"), 1, "only TIER_EXPR may test the prefix")
