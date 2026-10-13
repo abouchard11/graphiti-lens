@@ -4,13 +4,27 @@ A read-only explorer for the Graphiti temporal knowledge graph in `neo4j-graphit
 Nothing off-the-shelf understands Graphiti's bitemporal edges, so this does.
 
 ```bash
-~/dev/graphiti-lens/run.sh          # opens a one-time link (valid 5 min)
-~/dev/graphiti-lens/run.sh --port 8080 --no-token --no-open
-lsof -ti tcp:7878 | xargs kill     # stop
+./run.sh                            # opens a one-time link (valid 5 min)
+./run.sh --port 8080 --no-token --no-open
+lsof -ti tcp:7878 | xargs kill      # stop
 ```
 
 `run.sh` uses the first Python it finds that already has the `neo4j` driver
-(the Graphiti MCP venv), falling back to `uv run --with neo4j`. Nothing to install.
+(a local `.venv`, then the Graphiti MCP venv), falling back to `uv run --with neo4j`.
+
+**Requirements:** a Neo4j database holding a [Graphiti](https://github.com/getzep/graphiti)
+graph, and its credentials in `NEO4J_URI` / `NEO4J_USER` / `NEO4J_PASSWORD` (or in the
+Graphiti MCP server's `.env`, which the server reads as a fallback).
+
+## Tests
+
+The unit tests need the `neo4j` driver importable but no running database — the same
+two steps CI runs (`.github/workflows/tests.yml`):
+
+```bash
+python3 -m venv .venv && ./.venv/bin/pip install 'neo4j>=5,<6'
+./.venv/bin/python -m unittest discover -s tests -v
+```
 
 ## Modes
 
@@ -30,7 +44,7 @@ vision, or to anyone who does not think in pictures. `/api/explain` answers the 
 question in plain text:
 
 ```bash
-TOKEN=$(cat ~/dev/graphiti-lens/.lens-token)
+TOKEN=$(cat .lens-token)          # from the repo directory
 curl -s -H "X-Lens-Token: $TOKEN" '127.0.0.1:7878/api/explain?entity=Alex&days=14'
 curl -s -H "X-Lens-Token: $TOKEN" '127.0.0.1:7878/api/explain?entity=Alex&format=json'
 ```
@@ -59,7 +73,7 @@ dashed amber = superseded (`invalid_at`), dotted red = retracted (`expired_at`).
 `/api/health` returns the whole audit as stable JSON — same numbers as the Audit tab.
 
 ```bash
-~/dev/graphiti-lens/run.sh --no-token --no-open &   # or leave it running
+./run.sh --no-token --no-open &   # or leave it running
 curl -s 'http://127.0.0.1:7878/api/health' | jq '.checks[] | select(.status != "good")'
 curl -s 'http://127.0.0.1:7878/api/health?group=buylandfl' | jq .bitemporal
 ```
