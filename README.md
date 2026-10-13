@@ -67,6 +67,13 @@ curl -s 'http://127.0.0.1:7878/api/health?group=buylandfl' | jq .bitemporal
 Shape: `totals`, `bitemporal`, `provenance`, `hygiene`, `checks[]` (each with
 `value`, `status`, `detail`), `duplicates[]`, `ingest_daily[]`, `group_staleness[]`.
 
+**The same audit is also a file.** While the Lens runs it writes
+`~/.local/state/graphiti/lens-health.json` every 15 minutes (atomic write, so a reader
+never sees half a file). Anything that only needs the numbers — `truth.py`, the drift
+check, the memory daemon's `get_status` on the UpCloud host (the infra repo's state-pull
+job pushes the file there) — reads the file and needs no token and no live Lens. Tune
+with `LENS_HEALTH_FILE` / `LENS_HEALTH_INTERVAL_S`; `--no-health-file` turns it off.
+
 ## Security model
 
 - Binds `127.0.0.1` only. The bearer token has exactly one home: `.lens-token`, mode 600,
