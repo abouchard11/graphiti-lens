@@ -845,6 +845,38 @@ def write_token_file(path, token: str) -> None:
     path.chmod(0o600)
 
 
+# D-mem-010: the health audit also lives as a file on disk, so every reader (truth.py,
+# get_status on the UpCloud host once the file is pushed there, the Monday drift check)
+# needs neither the token nor a live Lens. 15 minutes matches the audit's own cadence.
+HEALTH_FILE = pathlib.Path(
+    os.environ.get("LENS_HEALTH_FILE")
+    or (pathlib.Path.home() / ".local" / "state" / "graphiti" / "lens-health.json")
+)
+HEALTH_FILE_INTERVAL_S = int(os.environ.get("LENS_HEALTH_INTERVAL_S", "900"))
+
+
+def write_health_file(path, payload: dict) -> pathlib.Path:
+    """Write the audit JSON atomically (tmp + rename): a reader never sees half a file,
+    and a crash mid-write leaves the previous good copy in place."""
+    path = pathlib.Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(jsonable(payload), default=str, separators=(",", ":")))
+    os.replace(tmp, path)
+    return path
+
+
+def health_file_loop(graph, path, interval_s: float, stop: threading.Event, log=print) -> None:
+    """Audit, write, sleep, repeat until `stop` is set. A failed audit (Neo4j down, tunnel
+    asleep) is logged once per tick and retried next tick; the last good file stays."""
+    while not stop.is_set():
+        try:
+            write_health_file(path, api_health(graph, {}))
+        except Exception as exc:  # noqa: BLE001 - keep the loop alive whatever the cause
+            log(f"  health-file: {type(exc).__name__}: {exc}")
+        stop.wait(interval_s)
+
+
 def issue_nonce(store: dict, now: float, ttl: int = NONCE_TTL) -> str:
     for value, expiry in list(store.items()):
         if expiry <= now:
@@ -1178,6 +1210,8 @@ def main():
     ap.add_argument("--host", default="127.0.0.1", help="loopback by default; change at your own risk")
     ap.add_argument("--no-token", action="store_true", help="disable the bearer token (loopback only)")
     ap.add_argument("--no-open", action="store_true", help="do not open a browser")
+    ap.add_argument("--no-health-file", action="store_true",
+                    help=f"do not write the audit to {HEALTH_FILE} every {HEALTH_FILE_INTERVAL_S}s")
     ap.add_argument("--verbose", action="store_true")
     args = ap.parse_args()
 
@@ -1207,9 +1241,20 @@ def main():
     print(f"  serving  http://{args.host}:{args.port}/")
     if token:
         print("  opening  one-time link, valid 5 minutes (the token stays in .lens-token)")
-    print("  mode     READ ONLY - write clauses are refused\n  ctrl-c to stop\n")
+    print("  mode     READ ONLY - write clauses are refused")
+    if not args.no_health_file:
+        print(f"  health   {HEALTH_FILE} every {HEALTH_FILE_INTERVAL_S}s")
+    print("  ctrl-c to stop\n")
     sys.stdout.flush()
 
+    stop = threading.Event()
+    if not args.no_health_file:
+        threading.Thread(
+            target=health_file_loop,
+            args=(graph, HEALTH_FILE, HEALTH_FILE_INTERVAL_S, stop),
+            name="health-file",
+            daemon=True,
+        ).start()
     if not args.no_open:
         threading.Timer(0.6, lambda: webbrowser.open(url)).start()
     try:
@@ -1217,6 +1262,7 @@ def main():
     except KeyboardInterrupt:
         print("\n  stopping")
     finally:
+        stop.set()
         httpd.server_close()
         graph.close()
 

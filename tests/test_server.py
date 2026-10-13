@@ -186,3 +186,71 @@ class TheProvenanceTierIsReadFromTheNodeFirst(unittest.TestCase):
     def test_no_query_keeps_a_prefix_check_of_its_own(self):
         src = (Path(__file__).resolve().parent.parent / "server.py").read_text()
         self.assertEqual(src.count("STARTS WITH 'OBSERVED:'"), 1, "only TIER_EXPR may test the prefix")
+
+
+class TheHealthFileIsTheAuditOnDisk(unittest.TestCase):
+    """D-mem-010 (2026-10-13): the audit is written to lens-health.json so readers need
+    neither the bearer token nor a live Lens. The UpCloud daemon's get_status reads a
+    pushed copy of this file; before it, every call said `reachable: false` from the host."""
+
+    def setUp(self):
+        import tempfile
+        self.m = load()
+        self.dir = Path(tempfile.mkdtemp())
+        self.path = self.dir / "nested" / "lens-health.json"
+
+    def test_it_writes_valid_json_and_creates_the_folder(self):
+        out = self.m.write_health_file(self.path, {"generated_at": "2026-10-13T00:00:00+00:00",
+                                                   "checks": [{"id": "dedup", "status": "good"}]})
+        import json
+        data = json.loads(out.read_text())
+        self.assertEqual(data["generated_at"], "2026-10-13T00:00:00+00:00")
+        self.assertEqual(data["checks"][0]["id"], "dedup")
+
+    def test_it_leaves_no_temp_file_behind(self):
+        self.m.write_health_file(self.path, {"generated_at": "x"})
+        self.assertEqual(sorted(p.name for p in self.path.parent.iterdir()), ["lens-health.json"])
+
+    def test_it_coerces_neo4j_temporals_like_the_http_surface_does(self):
+        class Stamp:
+            def isoformat(self):
+                return "2026-10-13T01:02:03+00:00"
+        self.m.write_health_file(self.path, {"last": Stamp()})
+        import json
+        self.assertEqual(json.loads(self.path.read_text())["last"], "2026-10-13T01:02:03+00:00")
+
+    def test_the_loop_survives_a_failed_audit_and_keeps_the_last_good_file(self):
+        import threading
+        calls = []
+        stop = threading.Event()
+
+        def fake_api_health(graph, q):
+            calls.append(1)
+            if len(calls) == 1:
+                return {"generated_at": "first"}
+            if len(calls) == 2:
+                raise RuntimeError("tunnel asleep")
+            stop.set()
+            return {"generated_at": "third"}
+
+        logged = []
+        self.m.api_health = fake_api_health
+        self.m.health_file_loop(None, self.path, 0, stop, log=logged.append)
+        import json
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(len(logged), 1)
+        self.assertIn("tunnel asleep", logged[0])
+        self.assertEqual(json.loads(self.path.read_text())["generated_at"], "third")
+
+    def test_the_loop_stops_when_told(self):
+        import threading
+        stop = threading.Event()
+        stop.set()
+        self.m.api_health = lambda g, q: self.fail("must not audit once stopped")
+        self.m.health_file_loop(None, self.path, 0, stop)
+        self.assertFalse(self.path.exists())
+
+    def test_the_flag_turns_it_off(self):
+        src = (Path(__file__).resolve().parent.parent / "server.py").read_text()
+        self.assertIn('"--no-health-file"', src)
+        self.assertIn("if not args.no_health_file:", src)
