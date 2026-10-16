@@ -556,6 +556,81 @@ def pct(num, den):
     return round(100.0 * num / den, 1) if den else 0.0
 
 
+def check_status(c: dict) -> str:
+    """good / warning / critical from value against good and warn. A check whose value is
+    None has nothing to measure yet and is 'not_measured': not good, not bad, and not
+    counted either way by anything that rolls statuses up."""
+    if c["value"] is None:
+        return "not_measured"
+    return "good" if c["value"] >= c["good"] else ("warning" if c["value"] >= c["warn"] else "critical")
+
+
+def evidence_checks(g: Graph, p: dict) -> list:
+    """The two stale-facts checks (2026-10-15). They read the (:Evidence) layer, which may not
+    exist in a given database yet, so with no Evidence node in scope both report value None
+    (not measured) instead of a false critical. `r.trust_state` is absent on a fact with no
+    evidence link: absent is never counted as stale, it is simply outside the denominator."""
+    unmeasured = "no evidence links recorded yet - measured once the first anchored write lands"
+    n_evidence = g.one(
+        "MATCH (v:Evidence) WHERE ($group IS NULL OR v.group_id = $group) RETURN count(v) AS c", p
+    ).get("c", 0) or 0
+    fresh = {"id": "evidence_fresh", "label": "Anchored facts whose evidence still matches",
+             "value": None, "unit": "%", "good": 95, "warn": 80, "detail": unmeasured}
+    cover = {"id": "anchor_coverage", "label": "New observed writes carrying evidence",
+             "value": None, "unit": "%", "good": 50, "warn": 20, "detail": unmeasured}
+    if n_evidence == 0:
+        return [fresh, cover]
+
+    # Same liveness as the Explore view (LIVE_PREDICATE), evaluated now.
+    asof = datetime.now(timezone.utc).isoformat()
+    row = g.one(
+        "MATCH ()-[r:RELATES_TO]->() WHERE ($group IS NULL OR r.group_id = $group) "
+        f"AND {LIVE_PREDICATE} AND r.trust_state IN ['current', 'stale', 'unverified'] "
+        "RETURN sum(CASE WHEN r.trust_state = 'current' THEN 1 ELSE 0 END) AS current, "
+        "sum(CASE WHEN r.trust_state = 'stale' THEN 1 ELSE 0 END) AS stale, "
+        "sum(CASE WHEN r.trust_state = 'unverified' THEN 1 ELSE 0 END) AS unverified",
+        {**p, "asof": asof},
+    )
+    current, stale = row.get("current", 0) or 0, row.get("stale", 0) or 0
+    # 'unverified' = evidence exists but nothing confirmed it yet (never checked, repo
+    # unreachable, or checkable only on the server). Outside the % either way: it is not
+    # evidence of staleness, and not of freshness.
+    unverified = row.get("unverified", 0) or 0
+    tail = f"; {unverified:,} unverified (not yet checked or source unreachable)" if unverified else ""
+    if current + stale == 0:
+        fresh["detail"] = "evidence is recorded but no live fact has been checked against it yet" + tail
+    else:
+        fresh["value"] = pct(current, current + stale)
+        if stale:
+            reasons = g.read(
+                "MATCH ()-[r:RELATES_TO]->() WHERE ($group IS NULL OR r.group_id = $group) "
+                f"AND {LIVE_PREDICATE} AND r.trust_state = 'stale' "
+                "UNWIND coalesce(r.stale_reasons, []) AS reason "
+                "WITH reason, max(r.stale_since) AS since RETURN reason ORDER BY since DESC LIMIT 3",
+                {**p, "asof": asof},
+            )
+            shown = "; ".join(str(r["reason"]) for r in reasons)
+            fresh["detail"] = f"{stale:,} stale" + (f": {shown}" if shown else "") + \
+                              f" ({current:,} current)" + tail
+        else:
+            fresh["detail"] = f"{current:,} anchored facts, none stale" + tail
+
+    obs = g.one(
+        "MATCH (e:Episodic) WHERE ($group IS NULL OR e.group_id = $group) "
+        "AND e.created_at >= datetime() - duration({days: 14}) "
+        f"AND {TIER_EXPR} = 'observed' "
+        "RETURN count(e) AS total, "
+        "sum(CASE WHEN EXISTS { (e)-[:CITES]->(:Evidence) } THEN 1 ELSE 0 END) AS cited", p
+    )
+    total, cited = obs.get("total", 0) or 0, obs.get("cited", 0) or 0
+    if total == 0:
+        cover["detail"] = "no observed writes in the last 14 days"
+    else:
+        cover["value"] = pct(cited, total)
+        cover["detail"] = f"{cited} of {total} observed episodes in the last 14 days cite evidence"
+    return [fresh, cover]
+
+
 def api_health(g: Graph, q) -> dict:
     """
     Audit metrics for the graph, scoped to one group_id or the whole store.
@@ -622,7 +697,9 @@ def api_health(g: Graph, q) -> dict:
         "AND e.created_at >= datetime() - duration({days: 60}) "
         "RETURN date(e.created_at) AS day, count(*) AS c ORDER BY day", p
     )
-    stale = g.read(
+    # Renamed 2026-10-15 (was `stale`): "stale" now means one thing only, a fact whose
+    # evidence no longer matches. A group that has simply stopped writing is quiet.
+    quiet_groups = g.read(
         "MATCH (e:Episodic) WITH e.group_id AS g, max(e.created_at) AS last, count(*) AS episodes "
         "RETURN g AS group, last, episodes ORDER BY last ASC LIMIT 40"
     )
@@ -724,8 +801,10 @@ def api_health(g: Graph, q) -> dict:
          "detail": f"{recent7} episodes in 7 days against an expected ~{expected7:.0f}"},
     ]
 
+    checks += evidence_checks(g, p)
     for c in checks:
-        c["status"] = "good" if c["value"] >= c["good"] else ("warning" if c["value"] >= c["warn"] else "critical")
+        c["status"] = check_status(c)
+    quiet_groups_json = [{k: jsonable(v) for k, v in r.items()} for r in quiet_groups]
 
     return {
         "group": group,
@@ -770,7 +849,10 @@ def api_health(g: Graph, q) -> dict:
         "checks": checks,
         "duplicates": [{k: jsonable(v) for k, v in r.items()} for r in dupe_rows],
         "ingest_daily": [{"day": jsonable(r["day"]), "count": r["c"]} for r in daily],
-        "group_staleness": [{k: jsonable(v) for k, v in r.items()} for r in stale],
+        "quiet_groups": quiet_groups_json,
+        # Deprecated alias of quiet_groups, kept for one release: README documents this key,
+        # so the drift check / truth.py may read it from lens-health.json. Remove after 2026-11.
+        "group_staleness": quiet_groups_json,
     }
 
 

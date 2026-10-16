@@ -254,3 +254,181 @@ class TheHealthFileIsTheAuditOnDisk(unittest.TestCase):
         src = (Path(__file__).resolve().parent.parent / "server.py").read_text()
         self.assertIn('"--no-health-file"', src)
         self.assertIn("if not args.no_health_file:", src)
+
+
+class FakeGraph:
+    """Answers api_health's queries by a distinctive substring of the Cypher, in order.
+    Anything unmatched returns no rows, which api_health reads as zeros. Records every
+    (cypher, params) so a test can assert on what was asked, not only on what came back."""
+
+    def __init__(self, answers=()):
+        self.answers = list(answers)
+        self.calls = []
+
+    def read(self, cypher, params=None, timeout=None):
+        self.calls.append((cypher, params or {}))
+        for needle, rows in self.answers:
+            if needle in cypher:
+                return rows
+        return []
+
+    def one(self, cypher, params=None, default=None):
+        rows = self.read(cypher, params)
+        return rows[0] if rows else (default if default is not None else {})
+
+
+def audit(answers, group=None):
+    """Run api_health against a FakeGraph; returns (payload, graph, checks by id)."""
+    import os, tempfile
+    os.environ["GRAPHITI_SPOOL_DIR"] = tempfile.mkdtemp()
+    mod = load()
+    g = FakeGraph(answers)
+    out = mod.api_health(g, {"group": [group]} if group else {})
+    return out, g, {c["id"]: c for c in out["checks"]}
+
+
+EVIDENCE_N = "MATCH (v:Evidence)"
+LIVE_TRUST = "r.trust_state IN ['current', 'stale', 'unverified']"
+STALE_REASONS = "UNWIND coalesce(r.stale_reasons"
+OBSERVED_14D = "duration({days: 14})"
+
+
+class StaleFactsChecks(unittest.TestCase):
+    """2026-10-15: two checks over the (:Evidence) layer. Until a database has Evidence they
+    must read 'not measured', not a false critical; 'stale' means a fact's evidence moved."""
+
+    def test_no_evidence_means_not_measured_not_critical(self):
+        _, g, checks = audit([(EVIDENCE_N, [{"c": 0}])])
+        for cid in ("evidence_fresh", "anchor_coverage"):
+            self.assertIsNone(checks[cid]["value"])
+            self.assertEqual(checks[cid]["status"], "not_measured")
+            self.assertIn("no evidence links recorded yet", checks[cid]["detail"])
+        asked = [c for c, _ in g.calls]
+        self.assertFalse(any(LIVE_TRUST in c or OBSERVED_14D in c for c in asked),
+                         "with no Evidence there is nothing to ask the fact edges")
+
+    def test_not_measured_does_not_touch_the_other_checks(self):
+        out, _, checks = audit([(EVIDENCE_N, [{"c": 0}])])
+        self.assertEqual(len(out["checks"]), 13)
+        self.assertEqual([c["id"] for c in out["checks"] if c["status"] == "not_measured"],
+                         ["evidence_fresh", "anchor_coverage"])
+        self.assertNotIn("not_measured", {c["status"] for c in out["checks"]
+                                          if c["id"] not in ("evidence_fresh", "anchor_coverage")})
+
+    def test_health_file_carries_not_measured_as_json_null(self):
+        import json, tempfile
+        out, _, _ = audit([(EVIDENCE_N, [{"c": 0}])])
+        path = Path(tempfile.mkdtemp()) / "lens-health.json"
+        load().write_health_file(path, out)
+        data = {c["id"]: c for c in json.loads(path.read_text())["checks"]}
+        self.assertIsNone(data["evidence_fresh"]["value"])
+        self.assertEqual(data["evidence_fresh"]["status"], "not_measured")
+
+    def test_evidence_fresh_is_current_over_current_plus_stale(self):
+        _, _, checks = audit([
+            (EVIDENCE_N, [{"c": 5}]),
+            (STALE_REASONS, [{"reason": "git:abouchard11/x@main:src/a.py#L1-L9 changed"},
+                             {"reason": "host:example.com/p moved"}]),
+            (LIVE_TRUST, [{"current": 18, "stale": 2}]),
+        ])
+        c = checks["evidence_fresh"]
+        self.assertEqual(c["value"], 90.0)
+        self.assertEqual(c["status"], "warning")
+        self.assertTrue(c["detail"].startswith("2 stale: git:abouchard11/x@main:src/a.py#L1-L9 changed"))
+        self.assertIn("host:example.com/p moved", c["detail"])
+
+    def test_unverified_facts_are_shown_but_never_move_the_percentage(self):
+        _, _, checks = audit([(EVIDENCE_N, [{"c": 3}]),
+                              (LIVE_TRUST, [{"current": 9, "stale": 1, "unverified": 7}])])
+        c = checks["evidence_fresh"]
+        self.assertEqual(c["value"], 90.0)
+        self.assertIn("7 unverified", c["detail"])
+        _, _, checks = audit([(EVIDENCE_N, [{"c": 3}]),
+                              (LIVE_TRUST, [{"current": 0, "stale": 0, "unverified": 4}])])
+        self.assertIsNone(checks["evidence_fresh"]["value"])
+        self.assertIn("4 unverified", checks["evidence_fresh"]["detail"])
+
+    def test_evidence_fresh_thresholds(self):
+        for current, stale, status in ((95, 5, "good"), (80, 20, "warning"), (79, 21, "critical")):
+            _, _, checks = audit([(EVIDENCE_N, [{"c": 1}]),
+                                  (LIVE_TRUST, [{"current": current, "stale": stale}])])
+            self.assertEqual(checks["evidence_fresh"]["status"], status, (current, stale))
+
+    def test_facts_without_a_trust_state_are_outside_the_denominator(self):
+        _, g, checks = audit([(EVIDENCE_N, [{"c": 1}]),
+                              (LIVE_TRUST, [{"current": 3, "stale": 0}])])
+        # 3 anchored facts, all current: 100%, however many unanchored facts the graph holds.
+        self.assertEqual(checks["evidence_fresh"]["value"], 100.0)
+        self.assertIn("none stale", checks["evidence_fresh"]["detail"])
+        q = [c for c, _ in g.calls if LIVE_TRUST in c][0]
+        self.assertIn("r.trust_state IN ['current', 'stale', 'unverified']", q)
+        self.assertNotIn("IS NULL OR r.trust_state", q)
+
+    def test_evidence_but_no_checked_fact_is_still_not_measured(self):
+        _, _, checks = audit([(EVIDENCE_N, [{"c": 4}]), (LIVE_TRUST, [{"current": 0, "stale": 0}])])
+        self.assertEqual(checks["evidence_fresh"]["status"], "not_measured")
+        self.assertIn("no live fact has been checked", checks["evidence_fresh"]["detail"])
+
+    def test_evidence_fresh_counts_only_live_edges(self):
+        mod = load()
+        _, g, _ = audit([(EVIDENCE_N, [{"c": 1}]), (LIVE_TRUST, [{"current": 1, "stale": 0}])])
+        q, params = [(c, p) for c, p in g.calls if LIVE_TRUST in c][0]
+        self.assertIn(mod.LIVE_PREDICATE, q, "same liveness as the Explore view")
+        self.assertIn("asof", params)
+
+    def test_anchor_coverage_math_and_thresholds(self):
+        for total, cited, value, status in ((10, 6, 60.0, "good"), (10, 3, 30.0, "warning"),
+                                            (10, 1, 10.0, "critical")):
+            _, _, checks = audit([(EVIDENCE_N, [{"c": 1}]),
+                                  (OBSERVED_14D, [{"total": total, "cited": cited}])])
+            c = checks["anchor_coverage"]
+            self.assertEqual((c["value"], c["status"]), (value, status))
+            self.assertIn(f"{cited} of {total} observed", c["detail"])
+
+    def test_anchor_coverage_only_looks_at_observed_episodes_via_the_stored_tier(self):
+        mod = load()
+        _, g, _ = audit([(EVIDENCE_N, [{"c": 1}]), (OBSERVED_14D, [{"total": 1, "cited": 1}])])
+        q = [c for c, _ in g.calls if OBSERVED_14D in c][0]
+        self.assertIn(f"{mod.TIER_EXPR} = 'observed'", q)
+        self.assertIn("[:CITES]->(:Evidence)", q)
+
+    def test_anchor_coverage_with_no_recent_observed_writes_is_not_measured(self):
+        _, _, checks = audit([(EVIDENCE_N, [{"c": 1}]), (OBSERVED_14D, [{"total": 0, "cited": 0}])])
+        self.assertEqual(checks["anchor_coverage"]["status"], "not_measured")
+        self.assertIn("no observed writes", checks["anchor_coverage"]["detail"])
+
+    def test_the_group_filter_reaches_both_checks(self):
+        _, g, _ = audit([(EVIDENCE_N, [{"c": 1}]),
+                         (LIVE_TRUST, [{"current": 1, "stale": 0}]),
+                         (OBSERVED_14D, [{"total": 1, "cited": 1}])], group="buylandfl")
+        for needle in (EVIDENCE_N, LIVE_TRUST, OBSERVED_14D):
+            q, params = [(c, p) for c, p in g.calls if needle in c][0]
+            self.assertIn("$group IS NULL OR", q)
+            self.assertEqual(params["group"], "buylandfl")
+
+    def test_status_helper_keeps_the_old_thresholds(self):
+        m = load()
+        c = {"good": 95, "warn": 80}
+        self.assertEqual(m.check_status({**c, "value": 95}), "good")
+        self.assertEqual(m.check_status({**c, "value": 80}), "warning")
+        self.assertEqual(m.check_status({**c, "value": 79.9}), "critical")
+        self.assertEqual(m.check_status({**c, "value": 0.0}), "critical")
+        self.assertEqual(m.check_status({**c, "value": None}), "not_measured")
+
+
+class QuietGroupsAreNotStaleFacts(unittest.TestCase):
+    """2026-10-15: the groups-by-last-write list was called 'stale'. Stale now means a fact
+    whose evidence changed; a group that stopped writing is quiet."""
+
+    ROWS = [{"group": "yapword", "last": "2026-09-01", "episodes": 12},
+            {"group": "global", "last": "2026-10-14", "episodes": 400}]
+
+    def test_quiet_groups_is_the_key_and_the_old_key_is_a_one_release_alias(self):
+        out, _, _ = audit([("AS last, count(*) AS episodes", self.ROWS), (EVIDENCE_N, [{"c": 0}])])
+        self.assertEqual([r["group"] for r in out["quiet_groups"]], ["yapword", "global"])
+        self.assertEqual(out["group_staleness"], out["quiet_groups"])
+
+    def test_the_ui_reads_the_new_key_and_says_quiet(self):
+        js = (Path(__file__).resolve().parent.parent / "static" / "app.js").read_text()
+        self.assertIn("h.quiet_groups", js)
+        self.assertNotIn("gone stale", js)
