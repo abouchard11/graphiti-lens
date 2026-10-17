@@ -955,18 +955,25 @@ async function renderAudit() {
   for (const c of h.checks) {
     const t = el("div", "tile");
     t.appendChild(el("div", "lbl", c.label));
-    const v = el("div", "val", String(c.value));
-    v.appendChild(el("span", "", c.unit));
+    // value null = not measured yet (no evidence recorded): show a dash and an empty meter,
+    // never a 0% bar or a colour, so it cannot read as a failure.
+    const measured = c.value != null;
+    const v = el("div", "val", measured ? String(c.value) : "—");
+    if (measured) v.appendChild(el("span", "", c.unit));
     t.appendChild(v);
     const badge = el("div", "badge " + c.status);
     const g = el("span", "g"); g.style.background = C[c.status] || C.ink3;
-    badge.appendChild(g); badge.appendChild(el("span", "", c.status === "good" ? "healthy" : c.status));
+    badge.appendChild(g);
+    badge.appendChild(el("span", "", c.status === "good" ? "healthy" : c.status === "not_measured" ? "not measured yet" : c.status));
     t.appendChild(badge);
     const meter = el("div", "meter");
-    const fill = el("i");
-    fill.style.width = Math.max(1.5, Math.min(100, c.value)) + "%";
-    fill.style.background = C[c.status] || C.ink3;
-    meter.appendChild(fill); t.appendChild(meter);
+    if (measured) {
+      const fill = el("i");
+      fill.style.width = Math.max(1.5, Math.min(100, c.value)) + "%";
+      fill.style.background = C[c.status] || C.ink3;
+      meter.appendChild(fill);
+    }
+    t.appendChild(meter);
     t.appendChild(el("div", "det", c.detail));
     tiles.appendChild(t);
   }
@@ -1017,12 +1024,12 @@ async function renderAudit() {
   ing.appendChild(sparkline(h.ingest_daily, 560, 150));
   two.appendChild(ing);
 
-  // stale projects
+  // quiet projects (a group that stopped writing; "stale" is reserved for facts)
   const st = el("div", "card2");
   st.appendChild(el("h3", "", "Quietest projects"));
-  st.appendChild(el("div", "cap", "Ordered by last episode. The top of this list is where your memory has gone stale."));
+  st.appendChild(el("div", "cap", "Ordered by last episode. The top of this list is where your memory has gone quiet."));
   st.appendChild(table(["Project", "Last episode", "Episodes"],
-    h.group_staleness.slice(0, 12).map((r) => [r.group, relDays(r.last), fmtN(r.episodes)]), [false, false, true]));
+    (h.quiet_groups || h.group_staleness || []).slice(0, 12).map((r) => [r.group, relDays(r.last), fmtN(r.episodes)]), [false, false, true]));
   two.appendChild(st);
 
   // duplicates

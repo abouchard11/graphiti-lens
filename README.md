@@ -31,7 +31,7 @@ python3 -m venv .venv && ./.venv/bin/pip install 'neo4j>=5,<6'
 | Mode | What it answers |
 |---|---|
 | **Explore** | *What do I know about X?* Full-text search over entity names, fact text, or episode content. Pick a result to open its neighbourhood. Double-click any node to expand one more hop. |
-| **Audit** | *Is the graph right?* Seven scored checks, the fact-lifecycle split, 60-day ingest sparkline, quietest projects, duplicate names, hygiene counts. |
+| **Audit** | *Is the graph right?* Thirteen checks (eleven graph-shape and operability checks, plus two on stale facts: anchored facts whose evidence still matches, and new observed writes carrying evidence), the fact-lifecycle split, 60-day ingest sparkline, quietest projects, duplicate names, hygiene counts. |
 | **Bridges** | *What connects my projects?* Entities whose name appears in more than one `group_id`. Graphiti dedupes inside a group, never across them, so this is the only place portfolio overlap shows up. Nodes colour by project here. |
 | **Episodes** | *Why did this episode produce these entities?* Timeline of ingests, each showing extracted entities, derived facts, `source_description`, and whether the content carries an `OBSERVED:`/`DERIVED:` tag. |
 | **Cypher** | Free-form read-only Cypher with seven Graphiti-aware recipes. Results render as both a table and a graph when the query returns nodes or relationships. |
@@ -74,12 +74,30 @@ dashed amber = superseded (`invalid_at`), dotted red = retracted (`expired_at`).
 
 ```bash
 ./run.sh --no-token --no-open &   # or leave it running
-curl -s 'http://127.0.0.1:7878/api/health' | jq '.checks[] | select(.status != "good")'
+curl -s 'http://127.0.0.1:7878/api/health' | jq '.checks[] | select(.status == "warning" or .status == "critical")'
 curl -s 'http://127.0.0.1:7878/api/health?group=buylandfl' | jq .bitemporal
 ```
 
 Shape: `totals`, `bitemporal`, `provenance`, `hygiene`, `checks[]` (each with
-`value`, `status`, `detail`), `duplicates[]`, `ingest_daily[]`, `group_staleness[]`.
+`value`, `status`, `detail`), `duplicates[]`, `ingest_daily[]`, `quiet_groups[]`.
+
+`status` is `good`, `warning`, `critical`, or (from 2026-10-15) `not_measured`. A
+`not_measured` check has `value: null`: it has nothing to score yet, and a consumer must
+count it as neither healthy nor failing. Today that is `evidence_fresh` and
+`anchor_coverage` on any database with no `(:Evidence)` node in scope. The old filter
+`select(.status != "good")` will therefore list them; use
+`select(.status == "warning" or .status == "critical")` to see only failures. (The memory
+server's `get_status` lists them under `lens.checks_not_measured`, not `checks_not_good`.)
+
+`evidence_fresh` is current ÷ (current + stale) over live anchored facts. Facts whose
+evidence nobody has confirmed yet (`trust_state = unverified`: never checked, source
+unreachable, or checkable only on the server) are counted in the detail line and kept out
+of the percentage: they are evidence of neither freshness nor staleness.
+
+`quiet_groups[]` (groups ordered by last write) was called `group_staleness[]` until
+2026-10-15, when "stale" was reserved for facts whose evidence no longer matches. The old
+key is still emitted with identical content for one release (remove after 2026-11); read
+`quiet_groups`.
 
 **The same audit is also a file.** While the Lens runs it writes
 `~/.local/state/graphiti/lens-health.json` every 15 minutes (atomic write, so a reader
@@ -127,7 +145,9 @@ colour-vision-deficient viewing.
 ## Extending
 
 - New audit check: add a query in `api_health`, then push an entry onto `checks`
-  with `good`/`warn` thresholds. The tile grid and the JSON both pick it up.
+  with `good`/`warn` thresholds. The tile grid and the JSON both pick it up. A check
+  that cannot be measured yet sets `value: None`; `check_status` turns that into
+  `not_measured`, and the tile shows a dash instead of a score.
 - New Cypher recipe: append to `SNIPPETS` in `app.js`.
 - Node budget: `DEFAULT_NODE_BUDGET` in `server.py` (hard cap 8000). Above ~4000
   nodes on screen the force layout is the bottleneck, not the renderer.
