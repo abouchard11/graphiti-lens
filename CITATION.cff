@@ -1,0 +1,25 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+title: "graphiti-lens"
+abstract: >-
+  A read-only explorer for the Graphiti temporal knowledge graph: bitemporal edges,
+  episodes and entities rendered in a local web view behind one-time access links,
+  because nothing off-the-shelf understands Graphiti's bitemporal model.
+authors:
+  - family-names: "Bouchard"
+    given-names: "Alex"
+    email: "alex@midnightdev.dev"
+    affiliation: "MidnightDev"
+    website: "https://midnightdev.dev"
+    orcid: "https://orcid.org/0009-0003-0911-9681"
+type: software
+repository-code: "https://github.com/abouchard11/graphiti-lens"
+url: "https://github.com/abouchard11/graphiti-lens"
+license: Apache-2.0
+date-released: 2026-09-12
+keywords:
+  - "graphiti"
+  - "knowledge-graph"
+  - "neo4j"
+  - "temporal-data"
+  - "agent-memory"
