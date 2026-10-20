@@ -3,8 +3,9 @@ message: "If you use this software, please cite it as below."
 title: "graphiti-lens"
 abstract: >-
   A read-only explorer for the Graphiti temporal knowledge graph: bitemporal edges,
-  episodes and entities rendered in a local web view behind one-time access links,
-  because nothing off-the-shelf understands Graphiti's bitemporal model.
+  episodes and entities rendered in a local web view, opened by default through a
+  one-time access link, because nothing off-the-shelf understands Graphiti's bitemporal
+  model.
 authors:
   - family-names: "Bouchard"
     given-names: "Alex"
@@ -16,7 +17,13 @@ type: software
 repository-code: "https://github.com/abouchard11/graphiti-lens"
 url: "https://github.com/abouchard11/graphiti-lens"
 license: Apache-2.0
-date-released: 2026-09-12
+version: "1.0.0"
+doi: "10.5281/zenodo.23502953"
+identifiers:
+  - type: doi
+    value: "10.5281/zenodo.23502953"
+    description: "Concept DOI: resolves to the latest archived release on Zenodo"
+date-released: 2026-10-20
 keywords:
   - "graphiti"
   - "knowledge-graph"

@@ -1,5 +1,7 @@
 # Graphiti Lens
 
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.23502953.svg)](https://doi.org/10.5281/zenodo.23502953)
+
 A read-only explorer for the Graphiti temporal knowledge graph in `neo4j-graphiti`.
 Nothing off-the-shelf understands Graphiti's bitemporal edges, so this does.
 
